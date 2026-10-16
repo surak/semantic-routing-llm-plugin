@@ -206,6 +206,7 @@ docs/ai-decision-router.md              plugin reference (APISIX plugin doc form
 t/plugin/ai-decision-router.t           Test::Nginx tests in APISIX's harness (t/run.sh)
 contrib/prepare_apisix_pr.py            copies the plugin into an APISIX checkout for a PR
 docs/design.md                          how it hooks into APISIX, design decisions
+docs/upstreaming.md                     how to submit the plugin to Apache APISIX
 site/                                   GitHub Pages homepage + docs viewer (site/build.sh)
 .github/workflows/                      CI (lint + e2e) and Pages deployment
 ```

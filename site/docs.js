@@ -8,10 +8,13 @@ const PAGES = [
   { id: "ai-decision-router", title: "ai-decision-router", file: "docs/ai-decision-router.md", src: "docs/ai-decision-router.md" },
   { id: "ai-decision-router-zh", title: "ai-decision-router（中文）", file: "docs/zh/ai-decision-router.md", src: "docs/zh/ai-decision-router.md" },
   { id: "design", title: "Design notes", file: "docs/design.md", src: "docs/design.md" },
+  { group: "Contributing" },
+  { id: "upstreaming", title: "Submitting to APISIX", file: "docs/upstreaming.md", src: "docs/upstreaming.md" },
 ];
 // Links between Markdown files become in-site links; other repo paths go to GitHub.
 const LINKS = { "README.md": "overview", "docs/ai-decision-router.md": "ai-decision-router",
-                "ai-decision-router.md": "ai-decision-router", "docs/design.md": "design", "design.md": "design" };
+                "ai-decision-router.md": "ai-decision-router", "docs/design.md": "design", "design.md": "design",
+                "docs/upstreaming.md": "upstreaming", "upstreaming.md": "upstreaming" };
 
 const slug = (t) => t.toLowerCase().replace(/<[^>]+>/g, "").replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "-");
 
