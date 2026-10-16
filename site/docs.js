@@ -6,6 +6,7 @@ const PAGES = [
   { id: "overview", title: "Overview", file: "docs/README.md", src: "README.md" },
   { group: "Plugin" },
   { id: "ai-decision-router", title: "ai-decision-router", file: "docs/ai-decision-router.md", src: "docs/ai-decision-router.md" },
+  { id: "ai-decision-router-zh", title: "ai-decision-router（中文）", file: "docs/zh/ai-decision-router.md", src: "docs/zh/ai-decision-router.md" },
   { id: "design", title: "Design notes", file: "docs/design.md", src: "docs/design.md" },
 ];
 // Links between Markdown files become in-site links; other repo paths go to GitHub.
@@ -16,6 +17,12 @@ const slug = (t) => t.toLowerCase().replace(/<[^>]+>/g, "").replace(/[^\w\s-]/g,
 
 function prepare(md) {
   md = md.replace(/^---\n[\s\S]*?\n---\n/, "");             // front matter
+  md = md.replace(/^import .*$/gm, "")                          // MDX imports
+         .replace(/^<Tabs[\s\S]*?\]\}>\s*$/gm, "")             // Docusaurus tabs
+         .replace(/^<\/?Tabs>\s*$/gm, "")
+         .replace(/^<\/TabItem>\s*$/gm, "")
+         .replace(/^<TabItem value="([^"]+)">\s*$/gm, (_, v) =>
+           `**${{ "admin-api": "Admin API", adc: "ADC", aic: "Ingress Controller" }[v] || v}**`);
   return md.replace(/^:::(\w+)\n([\s\S]*?)^:::\s*$/gm,       // Docusaurus admonitions
     (_, kind, body) => `<div class="admonition"><div class="label">${kind}</div>\n\n${body}\n</div>`);
 }
@@ -27,6 +34,9 @@ function fixLinks(root) {
     const [path, hash] = href.split("#");
     const clean = path.replace(/^\.\//, "");
     if (LINKS[clean]) a.href = "#" + LINKS[clean] + (hash ? "/" + hash : "");
+    // sibling plugin pages (./ai-proxy.md) live in the APISIX docs
+    else if (/^[\w-]+\.md$/.test(clean) && href.startsWith("./"))
+      a.href = `https://apisix.apache.org/docs/apisix/plugins/${clean.replace(/\.md$/, "")}/`;
     else a.href = `${REPO}/tree/main/${clean}`;
   });
 }

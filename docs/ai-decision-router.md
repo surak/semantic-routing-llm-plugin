@@ -5,76 +5,74 @@ keywords:
   - API Gateway
   - Plugin
   - ai-decision-router
-  - AI Gateway
-  - LLM routing
-description: The ai-decision-router plugin asks a decision model which LLM fits each request and routes the request to it, working together with ai-proxy, ai-proxy-multi or a plain upstream.
+  - AI
+  - LLM Routing
+description: The ai-decision-router Plugin asks a decision model which LLM fits each request and routes the request to it, working with ai-proxy, ai-proxy-multi, or a plain Upstream.
 ---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
 
 ## Description
 
-The `ai-decision-router` plugin routes each LLM request to the model best suited for it.
-For every request it sends the prompt to a typed decision model (a Clef-compatible
-`/v1/systemone` endpoint, by default Blablador's `alias-clef`) together with your
-candidate models and their routing roles. The decision model returns a choice and a
-confidence, and the plugin sends the request there:
+The `ai-decision-router` Plugin routes each LLM request to the model best suited for it. For every request, it sends the prompt to a typed decision model together with your candidate models and a routing role for each, and routes the request to the candidate the decision model picks.
 
-- with [`ai-proxy`](https://apisix.apache.org/docs/apisix/plugins/ai-proxy/), it rewrites the request body's `model`;
-- with [`ai-proxy-multi`](https://apisix.apache.org/docs/apisix/plugins/ai-proxy-multi/), it replaces the instance the balancer picked;
-- with a plain upstream, it rewrites the forwarded body's `model`.
+The decision model is any service that implements the Clef-compatible `/v1/systemone` API: it takes a `state` (the prompt) and typed `questions`, and returns a decision with per-option probabilities. The Plugin sends one `choice` question whose options are the candidates.
 
-Routing is advisory: when the decision model fails, times out or is unsure, the request
-goes to the `fallback` candidate instead of failing.
+The Plugin works with the [`ai-proxy`](./ai-proxy.md) Plugin, the [`ai-proxy-multi`](./ai-proxy-multi.md) Plugin, or a plain Upstream:
 
-The plugin runs in the `access` phase with priority `1039`, after `ai-proxy-multi` (1041)
-and `ai-proxy` (1040) and before `ai-cache` (1035) and `ai-rate-limiting` (1030).
+- With `ai-proxy`, it rewrites the `model` field of the request body.
+- With `ai-proxy-multi`, it replaces the instance picked by the balancer with the chosen candidate's instance.
+- With a plain Upstream, it rewrites the `model` field of the forwarded request body.
+
+Routing is advisory. When the decision model fails, times out, returns an unknown choice, or is less confident than `min_confidence`, the Plugin routes the request to the `fallback` candidate instead of rejecting it.
+
+The Plugin reads the prompt in a protocol-aware way, so it supports every chat protocol that `ai-proxy` supports, such as OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages. It runs in the `access` phase with priority `1039`, after `ai-proxy-multi` and `ai-proxy` and before `ai-cache` and `ai-rate-limiting`, so those Plugins see the routed model.
+
+Compared with the `semantic` algorithm of `ai-proxy-multi`, which picks the instance whose example prompts are most similar to the request, this Plugin needs no examples or embedding model: the routing policy is the plain-text routing role of each candidate.
 
 ## Attributes
 
 | Name | Type | Required | Default | Valid values | Description |
-| --- | --- | --- | --- | --- | --- |
-| candidates | array[object] | True | | 2–64 items | Models to choose between. |
-| candidates.name | string | True | | `^[A-Za-z0-9_.:-]+$`, unique | Option id given to the decision model. |
-| candidates.description | string | True | | | Routing role: which requests this model should get. |
-| candidates.model | string | False | `name` | | Value written into the request body's `model`. |
-| candidates.instance | string | False | `name` | | `ai-proxy-multi` instance to use. |
-| decision | object | False | `{}` | | Decision model settings. |
-| decision.endpoint | string | False | `https://api.blablador.fz-juelich.de/v1/systemone` | | Decision model API URL. |
-| decision.model | string | False | `alias-clef` | | Decision model name. |
-| decision.auth.header | object | False | | | Headers sent to the decision model, e.g. `Authorization`. Encrypted in etcd when data encryption is enabled. |
-| decision.instructions | string | False | built-in | | Instructions of the routing question. |
-| decision.timeout | integer | False | 5000 | ≥ 1 | Timeout of the decision request in milliseconds. |
-| decision.ssl_verify | boolean | False | true | | Verify the decision endpoint's TLS certificate. |
-| fallback | string | False | first candidate | a candidate name | Candidate used when no usable decision is available. |
-| min_confidence | number | False | 0 | [0, 1] | Decisions below this confidence use `fallback`. |
-| context | string | False | `last_user` | `last_user`, `conversation` | Text given to the decision model: the last user message, or the whole conversation. |
-| max_chars | integer | False | 8000 | ≥ 1 | Keep only the last `max_chars` characters of that text. |
-| trigger_models | array[string] | False | | | Route only requests whose `model` is in this list or missing. Unset: route all requests. |
-| rewrite_model | boolean | False | true | | Rewrite the request body's `model`. |
-| response_headers | boolean | False | true | | Add `X-AI-Routed-Model`, `X-AI-Routing-Confidence` and `X-AI-Routing-Fallback` to the response. |
+|------|------|----------|---------|--------------|-------------|
+| decision | object | True | | | Decision model configuration. |
+| decision.endpoint | string | True | | URL starting with `http://` or `https://` | URL of the decision API, for example `https://example.com/v1/systemone`. |
+| decision.model | string | True | | | Name of the decision model. |
+| decision.auth.header | object | False | | | Request headers sent to the decision model, such as `Authorization`. The values are encrypted with AES before being stored in etcd. |
+| decision.instructions | string | False | Generic routing instruction | | Instructions of the routing question. |
+| decision.timeout | integer | False | `5000` | >= 1 | Decision request timeout in milliseconds. |
+| decision.ssl_verify | boolean | False | `true` | | If `true`, verify the TLS certificate of the decision endpoint. |
+| candidates | array[object] | True | | 2 to 64 items | Models to choose between. |
+| candidates.name | string | True | | `^[A-Za-z0-9_.:-]+$`, unique | Option ID given to the decision model. |
+| candidates.description | string | True | | | Routing role of the candidate: which requests it should receive. |
+| candidates.model | string | False | `name` | | Value written into the `model` field of the request body. |
+| candidates.instance | string | False | `name` | | Name of the `ai-proxy-multi` instance to use. |
+| fallback | string | False | First candidate | A candidate `name` | Candidate used when no usable decision is available. |
+| min_confidence | number | False | `0` | [0, 1] | Decisions with a lower confidence use `fallback`. |
+| context | string | False | `last_user` | `last_user`, `conversation` | Text sent to the decision model. `last_user` sends the last user message. `conversation` sends every message as `role: text` lines. |
+| max_chars | integer | False | `8000` | >= 1 | Keep only the last `max_chars` characters of that text. |
+| trigger_models | array[string] | False | | | If set, only route requests whose `model` is in this list or missing, and pass other requests through unchanged. If unset or empty, route every request. |
+| rewrite_model | boolean | False | `true` | | If `true`, rewrite the `model` field of the request body. Set to `false` when the `ai-proxy-multi` instances set `options.model`. |
+| response_headers | boolean | False | `true` | | If `true`, add the `X-AI-Routed-Model`, `X-AI-Routing-Confidence`, and `X-AI-Routing-Fallback` response headers. |
+| fail_mode | string | False | `skip` | `skip`, `warn`, `error` | Behavior when the request is not a JSON request the Plugin can read. `skip`: pass the request through unchanged. `warn`: pass through and log a warning. `error`: reject the request. |
 
-The plugin sets the variable `$ai_routed_model` to the chosen model and updates
-`$request_llm_model`, so logger plugins, `ai-rate-limiting` and metrics see the routed model.
+The Plugin also sets the `$ai_routed_model` variable to the chosen model and updates `$request_llm_model`, so logger Plugins, `ai-rate-limiting`, and metrics see the routed model.
 
-## Enable plugin
+### Response Headers
 
-`ai-decision-router` is not bundled with APISIX. Put the repository on APISIX's Lua path
-and add the plugin to `plugins` in `config.yaml` (this list replaces the default one, so
-keep the plugins you use; `ai-proxy` also needs `prometheus`):
+| Header | Description |
+|--------|-------------|
+| `X-AI-Routed-Model` | Model the request was routed to. |
+| `X-AI-Routing-Confidence` | Confidence of the decision model in its choice. |
+| `X-AI-Routing-Fallback` | Reason the `fallback` was used: `decision error: ...`, `low confidence ...`, `unknown choice ...`, or `no prompt text`. |
 
-```yaml
-apisix:
-  extra_lua_path: "/opt/ai-decision-router/?.lua"
-plugins:
-  - ai-decision-router
-  - ai-proxy-multi
-  - ai-proxy
-  - prometheus
-```
+## Examples
 
-Then reload APISIX.
+The examples below use OpenAI-compatible models served by a gateway that also hosts a decision model. Replace the endpoints, model names, and keys with your own.
 
 :::note
-You can fetch the `admin_key` from `config.yaml` and save to an environment variable with the following command:
+
+You can fetch the `admin_key` from `config.yaml` and save it to an environment variable with the following command:
 
 ```bash
 admin_key=$(yq '.deployment.admin.admin_key[0].key' conf/config.yaml | sed 's/"//g')
@@ -82,97 +80,206 @@ admin_key=$(yq '.deployment.admin.admin_key[0].key' conf/config.yaml | sed 's/"/
 
 :::
 
-## Examples
+You can optionally save the API information to environment variables:
 
-### Route requests for `auto` to the best model
+```shell
+# Replace with your data
+export LLM_ENDPOINT=https://llm.example.com/v1/chat/completions
+export DECISION_ENDPOINT=https://llm.example.com/v1/systemone
+export API_KEY=your-api-key
+```
 
-The following example creates a route that answers OpenAI-style chat requests. Requests
-with `"model": "auto"` are routed by `alias-clef`; requests naming a model pass through.
+### Route Requests to the Best Model
+
+The following example demonstrates how to route requests that ask for the model `auto` to the best of four models. Requests that name a model are passed through unchanged.
+
+<Tabs
+groupId="api"
+defaultValue="admin-api"
+values={[
+{label: 'Admin API', value: 'admin-api'},
+{label: 'ADC', value: 'adc'}
+]}>
+
+<TabItem value="admin-api">
+
+Create a Route with the `ai-decision-router` and [`ai-proxy`](./ai-proxy.md) Plugins:
 
 ```shell
 curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
   -H "X-API-KEY: ${admin_key}" \
   -d '{
     "id": "ai-decision-router-route",
-    "uri": "/v1/chat/completions",
+    "uri": "/anything",
     "methods": ["POST"],
     "plugins": {
       "ai-decision-router": {
         "decision": {
-          "auth": { "header": { "Authorization": "Bearer '"$BLABLADOR_API_KEY"'" } }
+          "endpoint": "'"$DECISION_ENDPOINT"'",
+          "model": "alias-clef",
+          "auth": {
+            "header": {
+              "Authorization": "Bearer '"$API_KEY"'"
+            }
+          }
         },
         "trigger_models": ["auto"],
-        "fallback": "alias-large",
+        "fallback": "general",
         "min_confidence": 0.3,
         "candidates": [
-          { "name": "alias-fast",  "description": "Routine factual questions, short summaries and simple scripts." },
-          { "name": "alias-large", "description": "Broad multilingual synthesis with no dominant specialist." },
-          { "name": "alias-code",  "description": "Debugging existing code and reviewing patches." },
-          { "name": "alias-mimo-v2.6-pro", "description": "Rigorous mathematical proofs and deep multi-step reasoning." },
-          { "name": "alias-eve",   "description": "Earth observation, remote sensing and geoscience." }
+          { "name": "fast", "description": "Routine factual questions, short summaries, and simple scripts." },
+          { "name": "code", "description": "Debugging existing code and reviewing patches." },
+          { "name": "reasoning", "description": "Rigorous mathematical proofs and deep multi-step reasoning." },
+          { "name": "general", "description": "Broad synthesis with no dominant specialist." }
         ]
       },
       "ai-proxy": {
         "provider": "openai-compatible",
-        "auth": { "header": { "Authorization": "Bearer '"$BLABLADOR_API_KEY"'" } },
-        "override": { "endpoint": "https://api.blablador.fz-juelich.de/v1/chat/completions" }
+        "auth": {
+          "header": {
+            "Authorization": "Bearer '"$API_KEY"'"
+          }
+        },
+        "override": {
+          "endpoint": "'"$LLM_ENDPOINT"'"
+        }
       }
     }
   }'
 ```
 
-Send a request:
+</TabItem>
+
+<TabItem value="adc">
+
+Create a Route with the `ai-decision-router` and [`ai-proxy`](./ai-proxy.md) Plugins configured as such:
+
+```yaml title="adc.yaml"
+services:
+  - name: ai-decision-router-service
+    routes:
+      - name: ai-decision-router-route
+        uris:
+          - /anything
+        methods:
+          - POST
+        plugins:
+          ai-decision-router:
+            decision:
+              endpoint: "${DECISION_ENDPOINT}"
+              model: alias-clef
+              auth:
+                header:
+                  Authorization: "Bearer ${API_KEY}"
+            trigger_models:
+              - auto
+            fallback: general
+            min_confidence: 0.3
+            candidates:
+              - name: fast
+                description: Routine factual questions, short summaries, and simple scripts.
+              - name: code
+                description: Debugging existing code and reviewing patches.
+              - name: reasoning
+                description: Rigorous mathematical proofs and deep multi-step reasoning.
+              - name: general
+                description: Broad synthesis with no dominant specialist.
+          ai-proxy:
+            provider: openai-compatible
+            auth:
+              header:
+                Authorization: "Bearer ${API_KEY}"
+            override:
+              endpoint: "${LLM_ENDPOINT}"
+```
+
+Synchronize the configuration to the gateway:
 
 ```shell
-curl -i "http://127.0.0.1:9080/v1/chat/completions" -X POST \
+adc sync -f adc.yaml
+```
+
+</TabItem>
+
+</Tabs>
+
+Send a request to the Route:
+
+```shell
+curl -i "http://127.0.0.1:9080/anything" -X POST \
   -H "Content-Type: application/json" \
   -d '{
     "model": "auto",
-    "messages": [{ "role": "user", "content": "Prove that there are infinitely many primes." }]
+    "messages": [
+      { "role": "user", "content": "Prove that there are infinitely many primes." }
+    ]
   }'
 ```
 
-You should receive an `HTTP/1.1 200 OK` response from the chosen model, with:
+You should receive an `HTTP/1.1 200 OK` response from the `reasoning` model, with headers similar to the following:
 
 ```text
-X-AI-Routed-Model: alias-mimo-v2.6-pro
+X-AI-Routed-Model: reasoning
 X-AI-Routing-Confidence: 0.9326
 ```
 
-### Pick the instance of ai-proxy-multi
+Send a request that names a model:
 
-Name the `ai-proxy-multi` instances like the candidates (or set `candidates.instance`).
-The plugin replaces the instance the balancer picked. Set `rewrite_model` to `false` when
-the instances set `options.model` themselves:
+```shell
+curl -i "http://127.0.0.1:9080/anything" -X POST \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "fast",
+    "messages": [
+      { "role": "user", "content": "Prove that there are infinitely many primes." }
+    ]
+  }'
+```
+
+You should receive an `HTTP/1.1 200 OK` response from the `fast` model, without the routing headers.
+
+### Pick the Instance of ai-proxy-multi
+
+The following example demonstrates how to use the Plugin with [`ai-proxy-multi`](./ai-proxy-multi.md), where each instance sets its own model. Name the instances like the candidates, or set `candidates.instance`.
 
 ```shell
 curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
   -H "X-API-KEY: ${admin_key}" \
   -d '{
-    "id": "ai-decision-router-multi",
-    "uri": "/v1/chat/completions",
+    "id": "ai-decision-router-multi-route",
+    "uri": "/anything",
     "methods": ["POST"],
     "plugins": {
       "ai-decision-router": {
-        "decision": { "auth": { "header": { "Authorization": "Bearer '"$BLABLADOR_API_KEY"'" } } },
+        "decision": {
+          "endpoint": "'"$DECISION_ENDPOINT"'",
+          "model": "alias-clef",
+          "auth": { "header": { "Authorization": "Bearer '"$API_KEY"'" } }
+        },
         "rewrite_model": false,
         "fallback": "general",
         "candidates": [
-          { "name": "code",    "description": "Programming, debugging and code review." },
-          { "name": "general", "description": "Everything else: chat, writing, summaries." }
+          { "name": "code", "description": "Programming, debugging, and code review." },
+          { "name": "general", "description": "Everything else: chat, writing, and summaries." }
         ]
       },
       "ai-proxy-multi": {
         "instances": [
           {
-            "name": "code", "provider": "openai", "weight": 1,
-            "auth": { "header": { "Authorization": "Bearer '"$OPENAI_API_KEY"'" } },
-            "options": { "model": "gpt-5-codex" }
+            "name": "code",
+            "provider": "openai-compatible",
+            "weight": 1,
+            "auth": { "header": { "Authorization": "Bearer '"$API_KEY"'" } },
+            "options": { "model": "coder-model" },
+            "override": { "endpoint": "'"$LLM_ENDPOINT"'" }
           },
           {
-            "name": "general", "provider": "openai", "weight": 1,
-            "auth": { "header": { "Authorization": "Bearer '"$OPENAI_API_KEY"'" } },
-            "options": { "model": "gpt-5-mini" }
+            "name": "general",
+            "provider": "openai-compatible",
+            "weight": 1,
+            "auth": { "header": { "Authorization": "Bearer '"$API_KEY"'" } },
+            "options": { "model": "general-model" },
+            "override": { "endpoint": "'"$LLM_ENDPOINT"'" }
           }
         ]
       }
@@ -180,29 +287,21 @@ curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
   }'
 ```
 
-If the chosen instance fails with a status covered by `ai-proxy-multi`'s
-`fallback_strategy`, `ai-proxy-multi` retries on another instance with its own balancer.
+Requests about code go to the `code` instance, and other requests go to the `general` instance. If the chosen instance fails with a status covered by the `fallback_strategy` of `ai-proxy-multi`, `ai-proxy-multi` retries another instance using its own balancer.
 
-### Fall back when the decision is unsure
+### Fall Back When the Decision Is Unsure
 
-With `min_confidence`, decisions below the threshold go to `fallback`. The response then
-carries the reason:
+With `min_confidence` configured as in the first example, a decision with a lower confidence routes the request to `fallback`. The response then carries the reason:
 
 ```text
-X-AI-Routed-Model: alias-large
+X-AI-Routed-Model: general
+X-AI-Routing-Confidence: 0.21
 X-AI-Routing-Fallback: low confidence 0.21
 ```
 
-The same header reports `decision error: …` when the decision model is unreachable,
-times out or returns an error, `unknown choice …` and `no prompt text`.
+When the decision model is unreachable, times out, or returns an error, the request also goes to `fallback`, and the Plugin logs a warning:
 
-## Delete plugin
-
-To remove the plugin, delete its entry from the route's `plugins`. APISIX reloads
-automatically; no restart is needed.
-
-```shell
-curl "http://127.0.0.1:9180/apisix/admin/routes/ai-decision-router-route" -X PATCH \
-  -H "X-API-KEY: ${admin_key}" \
-  -d '{ "plugins": { "ai-decision-router": null } }'
+```text
+X-AI-Routed-Model: general
+X-AI-Routing-Fallback: decision error: request failed: timeout
 ```

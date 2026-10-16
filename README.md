@@ -6,7 +6,7 @@ Documentation: **https://surak.github.io/semantic-routing-llm-plugin/**
 
 An [Apache APISIX](https://apisix.apache.org/ai-gateway/) plugin that routes every
 LLM request to the model best suited for it. For each request it asks a typed
-**decision model** (a Clef-compatible `/v1/systemone` endpoint, by default
+**decision model** (a Clef-compatible `/v1/systemone` endpoint, such as
 Blablador's `alias-clef`) to pick one of your candidate models, then sends the
 request there.
 
@@ -108,8 +108,8 @@ the official Helm chart: see [`deploy/kubernetes/`](deploy/kubernetes/README.md)
 | `candidates[].description` | string, **required** | | Routing role: what requests this model should get. This is the routing policy. |
 | `candidates[].model` | string | `name` | Value written into the request's `model` field. |
 | `candidates[].instance` | string | `name` | `ai-proxy-multi` instance to use. |
-| `decision.endpoint` | string | `https://api.blablador.fz-juelich.de/v1/systemone` | Decision model API. |
-| `decision.model` | string | `alias-clef` | Decision model name. |
+| `decision.endpoint` | string, **required** | | Decision model API (`http(s)://…/v1/systemone`). |
+| `decision.model` | string, **required** | | Decision model name, e.g. `alias-clef`. |
 | `decision.auth.header` | object | | Headers sent to the decision model, e.g. `{"Authorization": "Bearer …"}`. Encrypted at rest when APISIX data encryption is on. |
 | `decision.instructions` | string | built-in | Instructions of the routing question. |
 | `decision.timeout` | integer (ms) | `5000` | Decision request timeout. |
@@ -121,6 +121,7 @@ the official Helm chart: see [`deploy/kubernetes/`](deploy/kubernetes/README.md)
 | `trigger_models` | array of strings | unset | Only route requests whose `model` is in this list (or missing). Unset: route every request. |
 | `rewrite_model` | boolean | `true` | Rewrite the body's `model` field. Turn off with `ai-proxy-multi` instances that set `options.model` themselves. |
 | `response_headers` | boolean | `true` | Add the `X-AI-Routing-*` response headers below. |
+| `fail_mode` | `skip` \| `warn` \| `error` | `skip` | What to do with requests that are not JSON: pass through, pass through and log a warning, or reject with 400. |
 
 ### Response headers
 
@@ -168,11 +169,15 @@ The decision model is advisory. It never blocks a request:
 - choice not among the candidates → `fallback`
 - confidence below `min_confidence` → `fallback`
 - no text in the request (e.g. image-only) → `fallback`
-- body not JSON → the plugin does nothing; later plugins report the error
+- body not JSON → controlled by `fail_mode` (default `skip`: pass through untouched)
 
 The reason is logged at `warn` level and sent in `X-AI-Routing-Fallback`.
 
 ## Testing
+
+```sh
+t/run.sh                 # APISIX's Test::Nginx harness: 21 blocks, 75 assertions
+```
 
 ```sh
 test/run_e2e.sh          # needs Docker; --keep leaves the stack running
@@ -197,7 +202,9 @@ examples/blablador/                     standalone gateway for Blablador (docker
 examples/admin-api-route.sh             same route via the Admin API (etcd mode)
 test/                                   end-to-end tests (docker compose + mock), live_routing.py
 deploy/kubernetes/                      Helm values + deploy script for Kubernetes
-docs/ai-decision-router.md              plugin reference (APISIX plugin doc format)
+docs/ai-decision-router.md              plugin reference (APISIX plugin doc format); docs/zh/ in Chinese
+t/plugin/ai-decision-router.t           Test::Nginx tests in APISIX's harness (t/run.sh)
+contrib/prepare_apisix_pr.py            copies the plugin into an APISIX checkout for a PR
 docs/design.md                          how it hooks into APISIX, design decisions
 site/                                   GitHub Pages homepage + docs viewer (site/build.sh)
 .github/workflows/                      CI (lint + e2e) and Pages deployment

@@ -80,16 +80,27 @@ request.
 
 ### Text extraction
 
-Request shapes understood:
-
-- OpenAI Chat Completions: `messages[].content` (string or content parts)
-- OpenAI Responses: `input` (string or item list)
-- Anthropic Messages: `messages[].content` blocks, top-level `system`
+The prompt is read with APISIX's `ai-protocols` module
+(`ai_protocols.get_messages(body, ctx)`), the same protocol-aware reader that
+`ai-proxy-multi`'s semantic routing and the prompt plugins use. Every chat
+protocol `ai-proxy` understands therefore works: OpenAI Chat Completions,
+OpenAI Responses, Anthropic Messages and Bedrock Converse. It detects the
+protocol itself, so it also works on routes without `ai-proxy`.
 
 Only text parts are used. `context: last_user` sends the last user message
 (the usual signal for "what is this request about"); `conversation` sends
 every message as `role: text` lines. Long text keeps its tail (`max_chars`),
 since the latest turn matters most.
+
+Requests that are not JSON follow `fail_mode` (the shared
+`ai-protocols.binding` helper): `skip` (default) passes them through,
+`warn` also logs, `error` rejects them with 400.
+
+### No vendor defaults
+
+`decision.endpoint` and `decision.model` are required. An earlier version
+defaulted to the Blablador endpoint, which is fine for a private deployment
+but not for a general-purpose plugin.
 
 ## Why a separate plugin, not a new ai-proxy-multi balancer
 
