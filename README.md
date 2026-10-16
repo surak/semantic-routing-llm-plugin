@@ -1,5 +1,9 @@
 # ai-decision-router
 
+[![CI](https://github.com/surak/semantic-routing-llm-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/surak/semantic-routing-llm-plugin/actions/workflows/ci.yml)
+
+Documentation: **https://surak.github.io/semantic-routing-llm-plugin/**
+
 An [Apache APISIX](https://apisix.apache.org/ai-gateway/) plugin that routes every
 LLM request to the model best suited for it. For each request it asks a typed
 **decision model** (a Clef-compatible `/v1/systemone` endpoint, by default
@@ -185,7 +189,10 @@ apisix/plugins/ai-decision-router.lua   the plugin
 examples/blablador/                     standalone gateway for Blablador (docker compose)
 examples/admin-api-route.sh             same route via the Admin API (etcd mode)
 test/                                   end-to-end tests (docker compose + mock)
+docs/ai-decision-router.md              plugin reference (APISIX plugin doc format)
 docs/design.md                          how it hooks into APISIX, design decisions
+site/                                   GitHub Pages homepage + docs viewer (site/build.sh)
+.github/workflows/                      CI (lint + e2e) and Pages deployment
 ```
 
 ## License

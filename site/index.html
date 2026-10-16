@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ai-decision-router</title>
+<meta name="description" content="An Apache APISIX plugin that routes every LLM request to the best model, chosen by a decision model.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script src="theme.js"></script>
+</head>
+<body>
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="./"><svg width="28" height="28" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#e8433e"/><circle cx="8" cy="16" r="3" fill="#fff"/><path d="M11 16h4l6-7h3M15 16h9M15 16l6 7h3" stroke="#fff" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg> <span>ai-decision-router</span></a>
+    <nav class="nav-links">
+      <a href="docs.html">Docs</a>
+      <a class="hide-sm" href="docs.html#design">Design</a>
+      <a href="https://github.com/surak/semantic-routing-llm-plugin">GitHub</a>
+      <button class="theme-btn" onclick="toggleTheme()" aria-label="Toggle dark mode">◐</button>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="wrap">
+    <span class="badge">Apache APISIX AI Gateway plugin</span>
+    <h1>Send every prompt to the <em>right model</em></h1>
+    <p class="lead">ai-decision-router asks a decision model which of your LLMs fits each request,
+      then routes it there, alongside <code>ai-proxy</code>, <code>ai-proxy-multi</code> or any upstream.
+      The routing policy is plain text you can read and review.</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="docs.html">Get started</a>
+      <a class="btn btn-ghost" href="https://github.com/surak/semantic-routing-llm-plugin">View on GitHub</a>
+    </div>
+  </div>
+</section>
+
+<section class="block">
+  <div class="wrap">
+    <div class="section-title">
+      <h2>How it works</h2>
+      <p>One extra step in the access phase, between APISIX's AI proxy and the model.</p>
+    </div>
+    <div class="flow">
+      <div class="card"><h3>Request arrives</h3><p>An OpenAI, Responses or Anthropic style request asks for <code>"model": "auto"</code>.</p></div>
+      <div class="card"><h3>Ask the decision model</h3><p>The prompt and your candidates' routing roles go to a Clef-compatible <code>/v1/systemone</code> endpoint as one choice question.</p></div>
+      <div class="card"><h3>Pick the winner</h3><p>The highest-probability candidate wins, unless it is below <code>min_confidence</code>; then the fallback is used.</p></div>
+      <div class="card"><h3>Route</h3><p>The body's <code>model</code> is rewritten, or the ai-proxy-multi instance is replaced. Headers report the choice.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="block alt">
+  <div class="wrap">
+    <div class="section-title">
+      <h2>Why use it</h2>
+    </div>
+    <div class="grid">
+      <div class="card"><h3>Readable policy</h3><p>Each candidate has a routing role written in plain language. No example corpus or embedding model to maintain.</p></div>
+      <div class="card"><h3>Calibrated choices</h3><p>The decision model returns a probability per candidate. Set a confidence threshold to fall back when it is unsure.</p></div>
+      <div class="card"><h3>Fails open</h3><p>If the decision model is down or slow, requests go to the fallback model instead of failing.</p></div>
+      <div class="card"><h3>Works with what you have</h3><p>Use it with <code>ai-proxy</code>, <code>ai-proxy-multi</code> or a plain upstream. No APISIX patch needed.</p></div>
+      <div class="card"><h3>Client choice respected</h3><p>With <code>trigger_models</code>, only requests for <code>auto</code> are routed; explicit model names pass through.</p></div>
+      <div class="card"><h3>Observable</h3><p><code>X-AI-Routed-Model</code>, confidence and fallback reason headers, plus <code>$ai_routed_model</code> for loggers.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="block">
+  <div class="wrap two-col">
+    <div>
+      <h2>Configure a route</h2>
+      <p>Add the plugin next to <code>ai-proxy</code>. Describe what each model is for; the decision model does the rest.</p>
+<pre><code class="language-yaml">plugins:
+  ai-decision-router:
+    decision:
+      model: alias-clef
+      auth:
+        header:
+          Authorization: "Bearer ${{BLABLADOR_API_KEY}}"
+    trigger_models: [auto]
+    fallback: alias-large
+    min_confidence: 0.3
+    candidates:
+      - name: alias-code
+        description: Debugging existing code and reviewing patches.
+      - name: alias-mimo-v2.6-pro
+        description: Rigorous proofs and deep multi-step reasoning.
+      - name: alias-eve
+        description: Earth observation and remote sensing.
+      - name: alias-large
+        description: Broad synthesis with no dominant specialist.
+  ai-proxy:
+    provider: openai-compatible
+    override:
+      endpoint: https://api.blablador.fz-juelich.de/v1/chat/completions</code></pre>
+    </div>
+    <div>
+      <h2>Routed live</h2>
+      <p>The bundled Blablador example with 14 candidate models, against the live API:</p>
+      <div class="table-scroll">
+      <table>
+        <tr><th>Prompt</th><th>Routed to</th><th>Conf.</th></tr>
+        <tr><td>Python traceback: KeyError in a loop</td><td><code>alias-code</code></td><td>0.83</td></tr>
+        <tr><td>Prove there are infinitely many primes</td><td><code>alias-mimo-v2.6-pro</code></td><td>0.93</td></tr>
+        <tr><td>Land-use change from Sentinel-2 series</td><td><code>alias-eve</code></td><td>0.97</td></tr>
+        <tr><td>German press release for a research centre</td><td><code>alias-apertus</code></td><td>0.86</td></tr>
+        <tr><td>What is the capital of France? (streamed)</td><td><code>alias-fast</code></td><td>0.95</td></tr>
+      </table>
+      </div>
+<pre><code class="language-shell">cd examples/blablador
+export BLABLADOR_API_KEY=...
+docker compose up -d
+curl -i localhost:9080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Prove that sqrt(2) is irrational"}]}'</code></pre>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>© 2026 Alexandre Strube · Apache License 2.0</span>
+    <span>Not an Apache Software Foundation project. Apache APISIX is a trademark of the ASF.</span>
+  </div>
+</footer>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>
