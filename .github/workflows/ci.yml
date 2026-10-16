@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: luacheck
+        run: docker run --rm -v "$PWD":/d -w /d pipelinecomponents/luacheck luacheck apisix
+      - name: shellcheck
+        run: shellcheck -S warning test/run_e2e.sh examples/admin-api-route.sh
+      - name: python syntax
+        run: python3 -m py_compile test/mock_server.py
+
+  e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        apisix: ["3.19.0-debian"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: end-to-end tests
+        env:
+          APISIX_VERSION: ${{ matrix.apisix }}
+        run: test/run_e2e.sh

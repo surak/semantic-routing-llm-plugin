@@ -1,0 +1,3 @@
+std = "ngx_lua"
+max_line_length = 100
+globals = { "ngx" }
