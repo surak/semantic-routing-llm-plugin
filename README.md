@@ -8,10 +8,11 @@ A new load-balancing algorithm for the [`ai-proxy-multi`](https://apisix.apache.
 plugin of [Apache APISIX](https://apisix.apache.org/ai-gateway/): **`system_one`** routes each LLM
 request to the instance that a *System One model* ranks highest.
 
-A System One model, such as [TypeSafe Jev](https://en.wikipedia.org/wiki/Jev_(AI_model)),
-Cloudflare Clef or Blablador's `alias-clef`, is a discriminative model: instead of generating
-text, it answers typed questions about an input with a probability distribution, in tens to
-hundreds of milliseconds. `system_one` asks one question per request, "which of these instances
+A System One model, such as TypeSafe's [Jev](https://en.wikipedia.org/wiki/Jev_(AI_model)), is
+a discriminative model: instead of generating text, it answers typed questions about an input
+with probability distributions, in tens to hundreds of milliseconds. It is served over the
+[System One API](docs/system-one-api.md) (`POST /v1/systemone`) by TypeSafe, OpenRouter and
+Blablador (`alias-clef`). `system_one` asks one question per request, "which of these instances
 should answer this prompt?", where each option is an instance described by its routing role in
 plain language:
 
@@ -133,9 +134,11 @@ test/run_e2e.sh          # stock APISIX 3.19 + overlay + mocks (Docker Compose)
 python3 test/live_routing.py http://127.0.0.1:9080/v1/chat/completions   # a live gateway
 ```
 
-`t/run.sh` runs the new `t/plugin/ai-proxy-multi-system-one.t` (19 blocks) and, as regression
+`t/run.sh` runs the new `t/plugin/ai-proxy-multi-system-one.t` (26 blocks) and, as regression
 checks, the semantic, retry and balancer suites of `ai-proxy-multi`. CI also applies the patch to
-APISIX `master` and runs APISIX's linters on it.
+APISIX `master` and runs the checks of APISIX's own CI on it: luacheck, lj-releng, reindex,
+codespell, eclint, markdownlint, the Chinese copywriting and line-break checks, and license
+headers.
 
 ## License
 

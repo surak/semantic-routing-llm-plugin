@@ -24,7 +24,7 @@ plugin was removed.
 
 | File | Change |
 | --- | --- |
-| `apisix/plugins/ai-proxy/system-one.lua` | New. Builds the System One request, sends it through the AI provider layer, turns the answer into a ranking. |
+| `apisix/plugins/ai-proxy/system-one.lua` | New. Client of the System One API: builds the request, sends it through the AI provider layer, turns the answer into a ranking. |
 | `apisix/plugins/ai-proxy/schema.lua` | `system_one` in the algorithm enum, `instances.description`, `system_one_opts`, two `encrypt_fields`. |
 | `apisix/plugins/ai-proxy-multi.lua` | Schema checks, the picker, ranked retries; health-checker setup factored out of `pick_target` into `fetch_checkers()`. |
 | `t/plugin/ai-proxy-multi-system-one.t` | New Test::Nginx suite. |
@@ -36,19 +36,21 @@ plugin was removed.
    `system_one`, the same way it dispatches to `pick_semantic_instance`.
 2. `system_one_ranking` asks the model once per request and stores the ranking in
    `ctx.ai_system_one_ranking`. The prompt is the last user message, extracted with the same
-   function `semantic` uses.
-3. The picker walks the ranking and takes the first instance that clears
-   `system_one_opts.threshold`, is not marked unhealthy by its active health checker, is not
-   rate limited (when `fallback_strategy` includes rate limiting), and has not been tried in this
-   request.
-4. If nothing qualifies, it takes the `fallback` instance, then the rest in configured order,
-   applying the same availability checks.
-5. On a 429 or 5xx covered by `fallback_strategy`, `retry_on_error` calls the picker again. The
+   function `semantic` uses. If there is no prompt or the System One request fails, the stored
+   ranking is empty and the reason is logged at `warn`.
+3. The picker takes the first available instance in this order: the ranked instances that clear
+   `system_one_opts.threshold`, most probable first; then the `fallback` instance; then the
+   others in configured order. An instance is available when it has not been tried in this
+   request, is not marked unhealthy by its active health checker, and is not rate limited (when
+   `fallback_strategy` includes rate limiting). Each instance is checked at most once per pick.
+4. On a 429 or 5xx covered by `fallback_strategy`, `retry_on_error` calls the picker again. The
    failed instance is marked as tried and the stored ranking is reused, so the retry goes to the
-   next instance without a second System One request.
+   next instance without a second System One request. When every instance has been tried, the
+   request fails with 502, as with the other algorithms.
 
 `retry_on_error` used to return early when there was no server picker (only `roundrobin` and
-`chash` have one). It now also continues when a System One ranking exists.
+`chash` have one). It now also continues when a System One ranking exists. `max_retries` and
+`retry_on_failure_within_ms` apply unchanged.
 
 ## Threshold and retries
 
@@ -68,22 +70,41 @@ Reviewers of `semantic` asked for, and the code now has, the same properties in 
 - **Shared transport.** The System One request goes through
   `apisix.plugins.ai-providers.openai-compatible`'s `request()`, like the embedding request. It
   sets none of the `client_*` options, so no client header, cookie or query parameter is
-  forwarded.
+  forwarded. The endpoint's own path is used; an endpoint without one gets `/v1/systemone`, the
+  way providers supply a default path.
+- **Protocol-aware prompt.** The prompt is read through `ai-protocols`, so OpenAI Responses,
+  Anthropic Messages and Bedrock Converse requests are routed too. The suite tests Responses and
+  Anthropic requests, as the `semantic` review asked.
 - **No upstream bodies in logs.** Errors report the status code only; the body may echo the
   prompt.
-- **Defensive parsing.** A 200 response that is not an object, has no answer, or carries a
-  probability that is not a finite number in [0, 1] (cjson decodes `1e999` to infinity) makes
-  the request fail open to the fallback instead of raising.
-- **Bounded input.** The state is truncated to 32 KiB, as `semantic` bounds its embedding input.
+- **Defensive parsing.** A 200 response that is not an object, has no `probabilities`, or gives an
+  instance a probability that is not a number in [0, 1] (cjson decodes `1e999` to infinity) makes
+  the request fail open to the fallback instead of raising. `choice` and `confidence` are not
+  read: they are derived from the distribution, and `confidence` is not a probability.
+- **Bounded input.** The state is cut to 16 KiB, as `semantic` bounds its embedding input. The cut
+  backs off to a UTF-8 character boundary: the API accepts only valid UTF-8, and a prompt cut in
+  the middle of a character would be refused and silently sent to the fallback.
 - **`*_opts` block.** Every option lives in `system_one_opts`; the only instance-level field is
   `description`, like `examples` for `semantic`.
 - **Debugging headers** mirror `X-AI-Semantic-*`: `X-AI-System-One-Probabilities` and
   `X-AI-System-One-Picked-Instance`.
 
+## Tests
+
+`t/plugin/ai-proxy-multi-system-one.t` has 26 blocks. Besides routing, threshold and fallback, it
+covers: failure modes of the System One API (non-200 without logging the body, scalar body,
+non-finite probability, no probabilities, timeout), client headers not forwarded, multimodal,
+Responses and Anthropic prompts, the UTF-8-safe cut, the default path, debugging headers, ranked
+retries with a single System One request, the threshold on retries, skipping unhealthy and
+rate-limited instances, every instance failing, and encryption of `system_one_opts.auth`.
+
+The tests for the UTF-8 cut, the default path and rate limiting were checked against deliberately
+broken code: each fails when its feature is removed.
+
 ## Limits
 
 - One System One request per client request adds its latency (bounded by
-  `system_one_opts.timeout`, 3 s by default). Decisions are not cached.
-- At most 64 instances: a System One choice question takes at most 64 options.
+  `system_one_opts.timeout`, 3 s by default). Rankings are not cached.
 - The System One model sees only the last user message, not the whole conversation, as with
   `semantic`.
+- `weight` and `priority` of the instances are not used.

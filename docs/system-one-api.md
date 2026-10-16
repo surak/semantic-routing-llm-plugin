@@ -1,44 +1,58 @@
 # The System One API
 
-`system_one` talks to a *System One model* over the System One API. This page describes the
-part of the API the balancer uses and the implementations it has been tested with.
+`system_one` talks to a model over the System One API (`POST /v1/systemone`). This page
+describes the part of the API the balancer uses, where the API is served, and what has been
+tested. Sources are listed at the end.
 
 ## What a System One model is
 
-The term comes from TypeSafe AI, which released [Jev](https://en.wikipedia.org/wiki/Jev_(AI_model))
-on 15 September 2026 as "the first System One model", after Daniel Kahneman's fast, intuitive
-"System 1" thinking. A System One model is discriminative, not generative: it returns typed
-values with probability estimates instead of text. TypeSafe reports latencies of 70 to 500
-milliseconds.
+The term comes from TypeSafe AI, which released Jev on 15 September 2026, in limited early
+access, as the first System One model, after Daniel Kahneman's fast, intuitive "System 1"
+thinking. In TypeSafe's words, "System One models are a class of AI models built to make fast,
+structured decisions that software can use directly". A System One model is discriminative, not
+generative: for each question it returns a probability distribution over the allowed answers
+instead of text. TypeSafe reports latencies of 70 to 500 milliseconds and trains the models for
+calibrated probabilities.
 
-Requests carry a `state` (a string, JSON object or array) and up to 64 typed `questions`. There
-are three question types:
+A request carries a `state` (a string, JSON object or array) and a map of typed `questions`:
 
 | Type | Meaning | `criteria` |
 | --- | --- | --- |
-| `noul` | yes/no | none |
-| `choice` | one of several unordered options | object: option → description |
-| `score` | a level on an ordered scale | array of level descriptions |
+| `noul` | Is a statement true? | optional |
+| `choice` | One of several unordered options | object: option → description, up to 255 options |
+| `score` | A level on an ordered scale | array of 2 to 10 level descriptions |
 
-The response holds one probability distribution per question. Derived values such as the most
-likely `choice` and a `confidence` are computed from the distribution by fixed formulas.
+The response holds one answer per question. A `choice` answer carries the probability of every
+option in `probabilities`, plus the most likely option (`choice`) and a `confidence`, both
+derived from the distribution.
 
-## Implementations
+TypeSafe's API takes UTF-8 JSON bodies of up to 32 MiB with finite numbers only. By default a
+request may use 64k tokens, and the state plus a question 32k tokens; longer inputs need its
+long-context mode.
 
-| Implementation | Endpoint | Model |
+## Where it is served
+
+| Provider | Endpoint | Model |
 | --- | --- | --- |
-| TypeSafe Jev | TypeSafe API (limited early access since September 2026) | see TypeSafe's documentation |
-| Cloudflare Clef, Clef-flash | Cloudflare (see Cloudflare's documentation) | see Cloudflare's documentation |
+| TypeSafe | `https://api.typesafe.ai/v1/systemone` | `jev-latest` |
+| OpenRouter | `https://openrouter.ai/api/v1/systemone` | `typesafe/jev-1.14` |
 | Blablador | `https://api.blablador.fz-juelich.de/v1/systemone` | `alias-clef` |
 
-The examples and live tests in this repository use Blablador's `alias-clef`.
+AI gateways such as TrueFoundry forward `/v1/systemone` unchanged. Cloudflare describes its Clef
+and Clef-flash decision models (October 2026, open weights under Apache 2.0) as "fully Jev-API
+compatible"; on Workers AI they are called through the Workers AI endpoint
+`/ai/run/@cf/cloudflare/clef` rather than `/v1/systemone`.
+
+The examples and live tests of this repository use Blablador's `alias-clef`. The Test::Nginx and
+end-to-end tests use mocks of the API.
 
 ## What `system_one` sends
 
 One `choice` question with the id `instance`. The options are the instance names; each option's
 criterion is the instance's `description`. The `state` is the last user message of the request,
 read with APISIX's protocol-aware reader (OpenAI Chat, OpenAI Responses, Anthropic Messages,
-Bedrock Converse), truncated to 32 KiB.
+Bedrock Converse) and cut to 16 KiB at a UTF-8 character boundary, so that it stays valid UTF-8
+and well within the default 32k-token limit.
 
 ```http
 POST /v1/systemone
@@ -48,7 +62,7 @@ Content-Type: application/json
 
 ```json
 {
-  "model": "alias-clef",
+  "model": "jev-latest",
   "state": "help me debug this python code",
   "questions": {
     "instance": {
@@ -64,6 +78,10 @@ Content-Type: application/json
 }
 ```
 
+`system_one_opts.endpoint` is the URL of the API. A URL without a path, such as
+`https://api.typesafe.ai`, gets the path `/v1/systemone`; a URL with a path, such as OpenRouter's,
+is used as it is.
+
 The request goes through APISIX's shared AI provider layer, like the embedding request of the
 `semantic` algorithm: none of the client's headers or query parameters are forwarded, only
 `system_one_opts.auth`.
@@ -72,11 +90,11 @@ The request goes through APISIX's shared AI provider layer, like the embedding r
 
 ```json
 {
-  "model": "alias-clef",
+  "model": "jev-latest",
   "answers": {
     "instance": {
       "choice": "code",
-      "confidence": 0.91,
+      "confidence": 0.865,
       "probabilities": { "code": 0.91, "default": 0.06, "translate": 0.03 }
     }
   },
@@ -85,10 +103,22 @@ The request goes through APISIX's shared AI provider layer, like the embedding r
 ```
 
 - `answers.instance.probabilities` ranks the instances, most probable first. Ties keep the
-  configured order. Options that are not instances are ignored; instances the model omits get 0.
-- Every probability must be a finite number between 0 and 1, or the response is rejected and
-  the request goes to the fallback.
-- A response without `probabilities` but with a `choice` ranks that choice first, with
-  `confidence` as its probability.
-- Any other response (non-200 status, invalid JSON, no answer for `instance`) sends the request
-  to the fallback. The response body is never logged, as it may echo the prompt.
+  configured order. An instance missing from the distribution has probability 0, and options
+  that are not instances are ignored.
+- The probability of every instance must be a number between 0 and 1. Otherwise, or if no
+  instance has a positive probability, the request goes to the fallback instance.
+- `choice` and `confidence` are not read. Both are derived from the distribution, and
+  `confidence` is not a probability: for `n` options it is `(p_max - 1/n) / (1 - 1/n)`.
+- Any other response (a status other than 200, invalid JSON, no `probabilities`) sends the
+  request to the fallback instance. The response body is never logged, as it may echo the
+  prompt.
+
+## Sources
+
+- TypeSafe: [API reference](https://docs.typesafe.ai/api), [models](https://docs.typesafe.ai/models),
+  [System One models](https://docs.typesafe.ai/concepts/system-one)
+- [Jev (AI model)](https://en.wikipedia.org/wiki/Jev_(AI_model)), Wikipedia
+- OpenRouter: [Jev](https://openrouter.ai/docs/guides/community/jev)
+- TrueFoundry: [Jev](https://www.truefoundry.com/docs/ai-gateway/jev)
+- Cloudflare: [Clef and Clef-flash](https://blog.cloudflare.com/clef-decision-models/),
+  [Clef on Workers AI](https://developers.cloudflare.com/workers-ai/models/clef/)
