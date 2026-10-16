@@ -52,7 +52,9 @@ One `choice` question with the id `instance`. The options are the instance names
 criterion is the instance's `description`. The `state` is the last user message of the request,
 read with APISIX's protocol-aware reader (OpenAI Chat, OpenAI Responses, Anthropic Messages,
 Bedrock Converse) and cut to 16 KiB at a UTF-8 character boundary, so that it stays valid UTF-8
-and well within the default 32k-token limit.
+and well within the default 32k-token limit. A cut inside a character would not be harmless:
+Blablador answers such a state with HTTP 500 (checked on 16 October 2026), which would send the
+request to the fallback instance.
 
 ```http
 POST /v1/systemone
@@ -108,7 +110,8 @@ The request goes through APISIX's shared AI provider layer, like the embedding r
 - The probability of every instance must be a number between 0 and 1. Otherwise, or if no
   instance has a positive probability, the request goes to the fallback instance.
 - `choice` and `confidence` are not read. Both are derived from the distribution, and
-  `confidence` is not a probability: for `n` options it is `(p_max - 1/n) / (1 - 1/n)`.
+  implementations define `confidence` differently: TypeSafe documents
+  `(p_max - 1/n) / (1 - 1/n)` for `n` options, while Blablador returns `p_max`.
 - Any other response (a status other than 200, invalid JSON, no `probabilities`) sends the
   request to the fallback instance. The response body is never logged, as it may echo the
   prompt.

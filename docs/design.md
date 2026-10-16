@@ -80,10 +80,12 @@ Reviewers of `semantic` asked for, and the code now has, the same properties in 
 - **Defensive parsing.** A 200 response that is not an object, has no `probabilities`, or gives an
   instance a probability that is not a number in [0, 1] (cjson decodes `1e999` to infinity) makes
   the request fail open to the fallback instead of raising. `choice` and `confidence` are not
-  read: they are derived from the distribution, and `confidence` is not a probability.
+  read: they are derived from the distribution, and implementations disagree on what
+  `confidence` is (TypeSafe documents `(p_max - 1/n) / (1 - 1/n)`, Blablador returns `p_max`).
 - **Bounded input.** The state is cut to 16 KiB, as `semantic` bounds its embedding input. The cut
   backs off to a UTF-8 character boundary: the API accepts only valid UTF-8, and a prompt cut in
-  the middle of a character would be refused and silently sent to the fallback.
+  the middle of a character would be refused and silently sent to the fallback. Blablador
+  answers HTTP 500 to such a state.
 - **`*_opts` block.** Every option lives in `system_one_opts`; the only instance-level field is
   `description`, like `examples` for `semantic`.
 - **Debugging headers** mirror `X-AI-Semantic-*`: `X-AI-System-One-Probabilities` and
