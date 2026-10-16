@@ -70,12 +70,6 @@ local lrucache_semantic_vectors = core.lrucache.new({
 -- tokens needs a tokenizer, using ~2 bytes/token so the cap stays under the token
 -- limit even for multi-byte scripts while keeping the whole routing prompt.
 local MAX_EMBED_PROMPT_BYTES = 16384
--- The prompt is sent as the System One `state`. Bounded for the same reasons;
--- System One models accept far longer inputs than embedding models (Jev: 64k
--- tokens), and the routing signal is in the first part of the prompt anyway.
-local MAX_SYSTEM_ONE_STATE_BYTES = 32768
--- A System One choice question takes at most this many options.
-local MAX_SYSTEM_ONE_INSTANCES = 64
 
 local plugin_name = "ai-proxy-multi"
 local _M = {
@@ -278,10 +272,6 @@ function _M.check_schema(conf)
         local scheme, host = opts.endpoint:match(endpoint_regex)
         if not scheme or not host then
             return false, "invalid `system_one_opts.endpoint`"
-        end
-        if #conf.instances > MAX_SYSTEM_ONE_INSTANCES then
-            return false, "the system_one algorithm supports at most " ..
-                MAX_SYSTEM_ONE_INSTANCES .. " instances"
         end
         -- Every instance is an option of the System One question, so each needs
         -- the criterion the model ranks it by. The fallback is ranked too.
@@ -947,24 +937,22 @@ local function pick_semantic_instance(ctx, conf)
 end
 
 
--- Ask the System One model once per request and remember the ranking, so
--- retries walk down it instead of asking again. When there is no usable ranking
--- (no prompt, request failed, malformed answer) the fallback instance goes first
--- and the rest follow in configured order.
+-- Ask the System One model once per request and keep the ranking, so retries
+-- walk down it instead of asking again. Without a usable ranking (no prompt,
+-- request failed, malformed answer) the ranking is empty and every pick takes
+-- the fallback order.
 local function system_one_ranking(ctx, conf)
-    if ctx.ai_system_one_ranking then
-        return ctx.ai_system_one_ranking
+    local ranking = ctx.ai_system_one_ranking
+    if ranking then
+        return ranking
     end
 
     local opts = conf.system_one_opts
-    local ranking, err
+    local err
     local prompt = extract_last_user_message(ctx)
     if not prompt then
         err = "no user message found"
     else
-        if #prompt > MAX_SYSTEM_ONE_STATE_BYTES then
-            prompt = sub(prompt, 1, MAX_SYSTEM_ONE_STATE_BYTES)
-        end
         -- pcall: the response is provider-controlled, so a raise here must fall
         -- back rather than 500.
         local ok, res, ferr = pcall(system_one.fetch, opts, prompt, conf.instances)
@@ -979,22 +967,16 @@ local function system_one_ranking(ctx, conf)
 
     if ranking then
         if opts.debugging then
-            local parts = {}
-            for _, c in ipairs(ranking) do
-                parts[#parts + 1] = c.name .. ":" .. str_format("%.4f", c.probability)
+            local parts = core.table.new(#ranking, 0)
+            for i, c in ipairs(ranking) do
+                parts[i] = c.name .. ":" .. str_format("%.4f", c.probability)
             end
             core.response.set_header("X-AI-System-One-Probabilities",
                                      table_concat(parts, ","))
         end
     else
         core.log.warn("system_one routing: ", err, ", falling back")
-        local fallback = opts.fallback or conf.instances[1].name
-        ranking = { { name = fallback, fallback = true } }
-        for _, inst in ipairs(conf.instances) do
-            if inst.name ~= fallback then
-                ranking[#ranking + 1] = { name = inst.name, fallback = true }
-            end
-        end
+        ranking = {}
     end
 
     ctx.ai_system_one_ranking = ranking
@@ -1003,17 +985,19 @@ local function system_one_ranking(ctx, conf)
 end
 
 
--- Pick the most probable instance that is healthy, not rate limited, not tried
--- yet in this request and clears the threshold; else the first available one in
--- fallback order.
+-- Pick the first available instance in this order: the ranked instances that
+-- clear the threshold, most probable first, then the fallback instance, then
+-- the others in configured order. An instance is available when it has not been
+-- tried in this request, is not marked unhealthy by its active health check and
+-- is not rate limited.
 local function pick_system_one_instance(ctx, conf)
     local opts = conf.system_one_opts
     local ranking = system_one_ranking(ctx, conf)
     local tried = ctx.ai_system_one_tried
 
-    local checkers, cerr = fetch_checkers(conf)
+    local checkers, err = fetch_checkers(conf)
     if not checkers then
-        return nil, nil, cerr
+        return nil, nil, err
     end
     local health_status
     if next(checkers) then
@@ -1025,54 +1009,42 @@ local function pick_system_one_instance(ctx, conf)
         ai_rate_limiting = require("apisix.plugins.ai-rate-limiting")
     end
 
-    local function available(name)
-        if tried[name] then
-            return false
-        end
-        if health_status and health_status[name] == false then
-            core.log.warn("system_one routing: instance ", name, " is unhealthy")
-            return false
-        end
-        if ai_rate_limiting and
-           not ai_rate_limiting.check_instance_status(nil, ctx, name) then
-            core.log.warn("system_one routing: instance ", name, " is rate limited")
-            return false
-        end
-        return true
-    end
-
-    local picked
+    local order = {}
     for _, cand in ipairs(ranking) do
-        if not cand.fallback and cand.probability >= opts.threshold
-           and available(cand.name)
-        then
-            picked = cand.name
-            break
+        if cand.probability >= opts.threshold then
+            order[#order + 1] = cand.name
         end
     end
+    local ranked = #order
+    order[#order + 1] = opts.fallback or conf.instances[1].name
+    for _, inst in ipairs(conf.instances) do
+        order[#order + 1] = inst.name
+    end
 
-    if not picked then
-        -- nothing (left) cleared the threshold: fallback first, then the rest
-        local retrying = next(tried) ~= nil
-        local order = { opts.fallback or conf.instances[1].name }
-        for _, inst in ipairs(conf.instances) do
-            order[#order + 1] = inst.name
-        end
-        for _, name in ipairs(order) do
-            if available(name) then
-                picked = name
+    local picked, picked_at
+    local checked = {}
+    for i, name in ipairs(order) do
+        if not tried[name] and not checked[name] then
+            checked[name] = true
+            if health_status and health_status[name] == false then
+                core.log.warn("system_one routing: instance ", name, " is unhealthy")
+            elseif ai_rate_limiting and
+                   not ai_rate_limiting.check_instance_status(nil, ctx, name) then
+                core.log.warn("system_one routing: instance ", name, " is rate limited")
+            else
+                picked, picked_at = name, i
                 break
             end
-        end
-        if picked and not ranking[1].fallback then
-            core.log.warn("system_one routing: no ", retrying and "untried " or "",
-                          "available instance cleared the threshold, falling back to ",
-                          picked)
         end
     end
 
     if not picked then
         return nil, nil, "all servers tried"
+    end
+    if picked_at > ranked and #ranking > 0 then
+        core.log.warn("system_one routing: no ", next(tried) and "untried " or "",
+                      "available instance cleared the threshold, falling back to ",
+                      picked)
     end
     tried[picked] = true
 

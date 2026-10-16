@@ -328,14 +328,15 @@ local system_one_opts_schema = {
     properties = {
         endpoint = {
             type = "string",
-            pattern = [[^https?://]],
-            description = "Full URL of the System One API, e.g. "
-                .. "https://api.example.com/v1/systemone.",
+            description = "URL of the System One API, e.g. "
+                .. "https://api.typesafe.ai/v1/systemone. Without a path, the "
+                .. "API's path /v1/systemone is used.",
         },
         model = {
             type = "string",
             minLength = 1,
-            description = "System One model that ranks the instances, e.g. jev.",
+            description = "System One model that ranks the instances, e.g. "
+                .. "jev-latest.",
         },
         auth = {
             type = "object",
@@ -346,6 +347,8 @@ local system_one_opts_schema = {
             -- header/query only, as for semantic_opts.embeddings: the call runs
             -- outside the client request, so ctx-dependent schemes cannot work.
             additionalProperties = false,
+            description = "Authentication headers or query parameters of the "
+                .. "System One request.",
         },
         instructions = {
             type = "string",
@@ -359,9 +362,9 @@ local system_one_opts_schema = {
             maximum = 1,
             default = 0,
             description = "Minimum probability the System One model must assign "
-                .. "to an instance for it to be picked. When no available "
-                .. "instance clears it, the request goes to the `fallback` "
-                .. "instance, or the first instance if none is named.",
+                .. "to an instance for it to be picked, also on retries. When no "
+                .. "available instance clears it, the request goes to the "
+                .. "`fallback` instance, or the first instance if none is named.",
         },
         fallback = {
             type = "string",
@@ -380,7 +383,11 @@ local system_one_opts_schema = {
                 .. "latency added when the endpoint is slow or down (the request "
                 .. "then fails open to the fallback).",
         },
-        ssl_verify = { type = "boolean", default = true },
+        ssl_verify = {
+            type = "boolean",
+            default = true,
+            description = "Verify the TLS certificate of the System One API.",
+        },
         debugging = {
             type = "boolean",
             default = false,
