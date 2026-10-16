@@ -17,6 +17,34 @@ jobs:
       - name: python syntax
         run: python3 -m py_compile test/mock_server.py
 
+  test-nginx:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test::Nginx suite (APISIX test harness)
+        run: t/run.sh
+
+  apisix-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: prepare the APISIX pull request tree
+        run: |
+          git clone --depth 1 https://github.com/apache/apisix.git /tmp/apisix
+          python3 contrib/prepare_apisix_pr.py /tmp/apisix
+      - name: luacheck (APISIX config)
+        run: docker run --rm -v /tmp/apisix:/d -w /d pipelinecomponents/luacheck luacheck -q apisix/plugins/ai-decision-router.lua
+      - name: markdownlint (APISIX config)
+        run: |
+          npm install -g markdownlint-cli@0.25.0
+          cd /tmp/apisix && markdownlint docs/en/latest/plugins/ai-decision-router.md docs/zh/latest/plugins/ai-decision-router.md
+      - name: autocorrect (zh docs)
+        run: |
+          npm install -g autocorrect-node
+          cd /tmp/apisix && autocorrect --lint docs/zh/latest/plugins/ai-decision-router.md
+      - name: license headers
+        run: docker run --rm -v /tmp/apisix:/github/workspace apache/skywalking-eyes header check
+
   e2e:
     runs-on: ubuntu-latest
     strategy:
