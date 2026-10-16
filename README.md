@@ -1,35 +1,72 @@
-# ai-decision-router
+# System One routing for Apache APISIX
 
 [![CI](https://github.com/surak/semantic-routing-llm-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/surak/semantic-routing-llm-plugin/actions/workflows/ci.yml)
 
 Documentation: **https://surak.github.io/semantic-routing-llm-plugin/**
 
-An [Apache APISIX](https://apisix.apache.org/ai-gateway/) plugin that routes every
-LLM request to the model best suited for it. For each request it asks a typed
-**decision model** (a Clef-compatible `/v1/systemone` endpoint, such as
-Blablador's `alias-clef`) to pick one of your candidate models, then sends the
-request there.
+A new load-balancing algorithm for the [`ai-proxy-multi`](https://apisix.apache.org/docs/apisix/plugins/ai-proxy-multi/)
+plugin of [Apache APISIX](https://apisix.apache.org/ai-gateway/): **`system_one`** routes each LLM
+request to the instance that a *System One model* ranks highest.
+
+A System One model, such as [TypeSafe Jev](https://en.wikipedia.org/wiki/Jev_(AI_model)),
+Cloudflare Clef or Blablador's `alias-clef`, is a discriminative model: instead of generating
+text, it answers typed questions about an input with a probability distribution, in tens to
+hundreds of milliseconds. `system_one` asks one question per request, "which of these instances
+should answer this prompt?", where each option is an instance described by its routing role in
+plain language:
 
 ```
-client ──► APISIX ──► ai-decision-router ──► decision model  (alias-clef: "which candidate?")
-                           │                    ◄── choice + confidence
-                           ▼
-                    ai-proxy / ai-proxy-multi / plain upstream ──► chosen model
+client ──► APISIX ai-proxy-multi ──► System One model: rank code / math / general for this prompt
+                    │                  ◄── {code: 0.91, general: 0.06, math: 0.03}
+                    ▼
+          most probable healthy instance ──► LLM
+          (on 429/5xx: next in the ranking, else the fallback)
 ```
 
-It works with any of APISIX's ways of reaching an LLM:
+```yaml
+ai-proxy-multi:
+  balancer:
+    algorithm: system_one
+  system_one_opts:
+    endpoint: https://api.blablador.fz-juelich.de/v1/systemone
+    model: alias-clef
+    auth: { header: { Authorization: "Bearer ..." } }
+    threshold: 0.3
+    fallback: general
+  fallback_strategy: [http_429, http_5xx]
+  instances:
+    - name: code
+      description: "Debugging existing code and reviewing patches."
+      provider: openai-compatible
+      ...
+    - name: general
+      description: "Broad questions with no dominant specialist."
+      ...
+```
 
-| Route also uses | What the plugin changes |
+Compared with `ai-proxy-multi`'s `semantic` algorithm (embedding similarity to example
+prompts), the policy is one readable sentence per instance, no embedding model is needed, and
+because every instance gets a probability, `system_one` can skip unhealthy or rate-limited
+instances and retry down the ranking.
+
+## Status
+
+The algorithm is implemented as a change to APISIX itself, on the branch
+[`surak/apisix:feat/ai-proxy-multi-system-one`](https://github.com/surak/apisix/tree/feat/ai-proxy-multi-system-one),
+to be proposed upstream (see [Submitting to APISIX](docs/upstreaming.md)). This repository is the
+project home: documentation, examples, deployment and tests, and a way to run the feature on a
+released APISIX today:
+
+| Directory | Contents |
 | --- | --- |
-| `ai-proxy` | rewrites the request body's `model` to the chosen candidate |
-| `ai-proxy-multi` | overrides the balancer's picked instance with the chosen one (and optionally the `model`) |
-| a plain `upstream` | rewrites the forwarded JSON body's `model` |
-
-Unlike `ai-proxy-multi`'s built-in `semantic` algorithm (embedding similarity
-against example prompts), the decision model reads natural-language **routing
-roles** you write for each candidate, and returns a calibrated probability per
-candidate. No example corpus or embedding model is needed, and the policy is a
-plain-text description you can review and change.
+| `patches/` | The branch as a patch series for `git am` on apache/apisix `master` |
+| `overlay/` | The three changed Lua modules, to run `system_one` on APISIX 3.19 unchanged |
+| `examples/blablador/` | Gateway routing to 14 Blablador models with `alias-clef` (Docker Compose) |
+| `deploy/kubernetes/` | Helm values and a deploy script for Kubernetes |
+| `test/` | End-to-end tests (Docker Compose + mock System One API and LLMs), live routing test |
+| `t/` | Runs APISIX's Test::Nginx suites with the patch applied |
+| `docs/`, `site/` | Documentation and the GitHub Pages site |
+| `contrib/` | Refreshes `patches/` and `overlay/` from the APISIX branch |
 
 ## Quick start (Blablador)
 
@@ -46,171 +83,61 @@ curl -i localhost:9080/v1/chat/completions -H 'Content-Type: application/json' -
 
 ```
 HTTP/1.1 200 OK
-X-AI-Routed-Model: alias-mimo-v2.6-pro
-X-AI-Routing-Confidence: 0.9326
-...
+X-AI-System-One-Picked-Instance: alias-mimo-v2.6-pro
+X-AI-System-One-Probabilities: alias-mimo-v2.6-pro:0.9410,alias-mimo-v2.6-flash:0.0201,...
 ```
 
-Clients that ask for `"model": "auto"` (or send no model) are routed; a client
-asking for a concrete model such as `alias-code` is passed through untouched.
-The example's 14 candidates and their routing roles come from the
-`LLM router` preset of
-decision-model-frontend.
+The example has `debugging` on, which adds those headers; turn it off in production.
 
 Observed with the live Blablador API (2026-10-16):
 
-| Prompt | Routed to | Confidence |
+| Prompt | Picked instance | Probability |
 | --- | --- | --- |
-| Python traceback: KeyError in a loop | `alias-code` | 0.83 |
-| Prove there are infinitely many primes | `alias-mimo-v2.6-pro` | 0.93 |
-| Land-use change from Sentinel-2 time series | `alias-eve` | 0.97 |
-| German press release for the Forschungszentrum | `alias-apertus` | 0.86 |
-| What is the capital of France? (streamed) | `alias-fast` | 0.95 |
+| Python traceback: KeyError in a loop | `alias-code` | 0.81 |
+| Implement an LRU cache in Rust | `alias-glm-5.3-flash` | 0.74 |
+| One-line bash, "in 2 seconds" | `alias-qwen38-quick` | 0.95 |
+| Prove √2 is irrational | `alias-mimo-v2.6-pro` | 0.94 |
+| Sentinel-2 deforestation pipeline | `alias-eve` | 0.95 |
+| German press release | `alias-apertus` | 0.91 |
+| Rainy-Monday motivation | `alias-muse` | 0.89 |
+| 400 PDFs of meeting minutes | `alias-kimi-k3-1m` | 0.93 |
+| Capital of Australia | `alias-fast` | 0.94 |
+| Multi-agent deployment system | `alias-huge` (0.92) answered 503, so the request was retried on the fallback `alias-large` | |
 
-## Installation
+## Run on APISIX 3.19
 
-1. Put the plugin on APISIX's Lua path. Either copy
-   `apisix/plugins/ai-decision-router.lua` into APISIX's own
-   `apisix/plugins/` directory, or mount this repository and point
-   `extra_lua_path` at it:
+`ai-proxy-multi.lua` and `apisix/plugins/ai-proxy/` are identical in APISIX 3.19.0 and `master`,
+so the overlay works on the released version. Put `overlay/` first on the Lua path:
 
-   ```yaml
-   # conf/config.yaml
-   apisix:
-     extra_lua_path: "/opt/ai-decision-router/?.lua"   # dir containing apisix/plugins/
-   ```
+```yaml
+# conf/config.yaml
+apisix:
+  extra_lua_path: "/path/to/overlay/?.lua"
+```
 
-2. Enable it. Listing `plugins` in `config.yaml` **replaces** the default
-   list, so keep the plugins you use. `ai-proxy` needs `prometheus` loaded too:
-
-   ```yaml
-   plugins:
-     - ai-decision-router
-     - ai-proxy-multi
-     - ai-proxy
-     - prometheus
-     # ... the rest of your plugins
-   ```
-
-3. Restart APISIX (or `apisix reload`), then attach the plugin to a route
-   together with `ai-proxy` / `ai-proxy-multi` (see
-   [`examples/`](examples/)).
-
-Tested with APISIX 3.19.0 (`apache/apisix:3.19.0-debian`), and on Kubernetes with
-the official Helm chart: see [`deploy/kubernetes/`](deploy/kubernetes/README.md).
+and reload. Keep the default plugin list (do not set `plugins`), or keep `ai-proxy-multi` in it.
+On Kubernetes, `deploy/kubernetes/deploy.sh` does this with the official Helm chart; see
+[deploy/kubernetes](deploy/kubernetes/README.md).
 
 ## Configuration
 
-| Field | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `candidates` | array, 2–64, **required** | | The models to choose between. |
-| `candidates[].name` | string, **required** | | Option id given to the decision model (`[A-Za-z0-9_.:-]+`). |
-| `candidates[].description` | string, **required** | | Routing role: what requests this model should get. This is the routing policy. |
-| `candidates[].model` | string | `name` | Value written into the request's `model` field. |
-| `candidates[].instance` | string | `name` | `ai-proxy-multi` instance to use. |
-| `decision.endpoint` | string, **required** | | Decision model API (`http(s)://…/v1/systemone`). |
-| `decision.model` | string, **required** | | Decision model name, e.g. `alias-clef`. |
-| `decision.auth.header` | object | | Headers sent to the decision model, e.g. `{"Authorization": "Bearer …"}`. Encrypted at rest when APISIX data encryption is on. |
-| `decision.instructions` | string | built-in | Instructions of the routing question. |
-| `decision.timeout` | integer (ms) | `5000` | Decision request timeout. |
-| `decision.ssl_verify` | boolean | `true` | Verify the decision endpoint's TLS certificate. |
-| `fallback` | string | first candidate | Candidate used when the decision fails or is unsure. |
-| `min_confidence` | number 0–1 | `0` | Decisions below this confidence use `fallback`. |
-| `context` | `last_user` \| `conversation` | `last_user` | What the decision model sees: the last user message, or the whole conversation (`role: text` lines, system prompt included). |
-| `max_chars` | integer | `8000` | Keep only the last `max_chars` characters of that text. |
-| `trigger_models` | array of strings | unset | Only route requests whose `model` is in this list (or missing). Unset: route every request. |
-| `rewrite_model` | boolean | `true` | Rewrite the body's `model` field. Turn off with `ai-proxy-multi` instances that set `options.model` themselves. |
-| `response_headers` | boolean | `true` | Add the `X-AI-Routing-*` response headers below. |
-| `fail_mode` | `skip` \| `warn` \| `error` | `skip` | What to do with requests that are not JSON: pass through, pass through and log a warning, or reject with 400. |
-
-### Response headers
-
-| Header | Value |
-| --- | --- |
-| `X-AI-Routed-Model` | the model the request was sent to |
-| `X-AI-Routing-Confidence` | decision model's confidence for that choice (absent on fallback without a decision) |
-| `X-AI-Routing-Fallback` | why the fallback was used: `decision error: …`, `low confidence …`, `unknown choice …`, `no prompt text` |
-
-### Variables for logging
-
-`$ai_routed_model` holds the chosen model. It is an APISIX context variable, so
-logger plugins' `log_format` (e.g. `http-logger`) can use it; nginx's own
-`access_log_format` cannot. `$request_llm_model` (APISIX's own variable) is updated to the
-chosen model as well, so `ai-rate-limiting`, prometheus labels and loggers see it.
-
-## Using it with ai-proxy-multi
-
-Name each instance like the candidate (or set `candidates[].instance`). The
-plugin then replaces the instance the balancer picked:
-
-```yaml
-plugins:
-  ai-decision-router:
-    rewrite_model: false            # instances pin their own options.model
-    fallback: general
-    candidates:
-      - { name: code,    description: "Programming and debugging." }
-      - { name: general, description: "Everything else." }
-  ai-proxy-multi:
-    instances:
-      - { name: code,    provider: openai, weight: 1, options: { model: gpt-5-codex }, auth: {...} }
-      - { name: general, provider: openai, weight: 1, options: { model: gpt-5-mini },  auth: {...} }
-```
-
-`ai-proxy-multi`'s own retry logic (`fallback_strategy`) still applies: if the
-chosen instance fails with a 429/5xx, ai-proxy-multi picks another instance
-with its balancer.
-
-## Failure behaviour
-
-The decision model is advisory. It never blocks a request:
-
-- decision endpoint down, slow (beyond `decision.timeout`), non-200 or malformed → `fallback`
-- choice not among the candidates → `fallback`
-- confidence below `min_confidence` → `fallback`
-- no text in the request (e.g. image-only) → `fallback`
-- body not JSON → controlled by `fail_mode` (default `skip`: pass through untouched)
-
-The reason is logged at `warn` level and sent in `X-AI-Routing-Fallback`.
+`balancer.algorithm: system_one`, the options under `system_one_opts`, and a `description` on
+every instance. See the [configuration reference](docs/system-one.md) and the
+[System One API](docs/system-one-api.md) it talks to.
 
 ## Testing
 
 ```sh
-t/run.sh                 # APISIX's Test::Nginx harness: 21 blocks, 75 assertions
+t/run.sh                 # APISIX's Test::Nginx suites with the patch applied
+test/run_e2e.sh          # stock APISIX 3.19 + overlay + mocks (Docker Compose)
+python3 test/live_routing.py http://127.0.0.1:9080/v1/chat/completions   # a live gateway
 ```
 
-```sh
-test/run_e2e.sh          # needs Docker; --keep leaves the stack running
-```
-
-Starts APISIX 3.19 with the plugin and a Python mock that acts as both the
-decision model and the LLM, then checks 20 cases: ai-proxy, ai-proxy-multi,
-plain upstream, fallback on decision errors, `min_confidence`,
-`trigger_models`, Responses-API bodies and the decision request itself.
-
-Against a running gateway with real models:
-
-```sh
-python3 test/live_routing.py http://127.0.0.1:9080/v1/chat/completions
-```
-
-## Repository layout
-
-```
-apisix/plugins/ai-decision-router.lua   the plugin
-examples/blablador/                     standalone gateway for Blablador (docker compose)
-examples/admin-api-route.sh             same route via the Admin API (etcd mode)
-test/                                   end-to-end tests (docker compose + mock), live_routing.py
-deploy/kubernetes/                      Helm values + deploy script for Kubernetes
-docs/ai-decision-router.md              plugin reference (APISIX plugin doc format); docs/zh/ in Chinese
-t/plugin/ai-decision-router.t           Test::Nginx tests in APISIX's harness (t/run.sh)
-contrib/prepare_apisix_pr.py            copies the plugin into an APISIX checkout for a PR
-docs/design.md                          how it hooks into APISIX, design decisions
-docs/upstreaming.md                     how to submit the plugin to Apache APISIX
-site/                                   GitHub Pages homepage + docs viewer (site/build.sh)
-.github/workflows/                      CI (lint + e2e) and Pages deployment
-```
+`t/run.sh` runs the new `t/plugin/ai-proxy-multi-system-one.t` (19 blocks) and, as regression
+checks, the semantic, retry and balancer suites of `ai-proxy-multi`. CI also applies the patch to
+APISIX `master` and runs APISIX's linters on it.
 
 ## License
 
-Apache License 2.0 (same as Apache APISIX), see [LICENSE](LICENSE).
+Apache License 2.0, see [LICENSE](LICENSE). `overlay/` and `patches/` contain modified Apache
+APISIX source files and keep their ASF license headers; see [NOTICE](NOTICE).

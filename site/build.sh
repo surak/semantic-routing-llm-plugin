@@ -10,3 +10,4 @@ cp README.md _site/docs/README.md
 cp docs/*.md _site/docs/
 mkdir -p _site/docs/zh
 cp docs/zh/*.md _site/docs/zh/
+cp deploy/kubernetes/README.md _site/docs/kubernetes.md
