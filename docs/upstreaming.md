@@ -116,7 +116,8 @@ request. Failures fail open to `system_one_opts.fallback`.
 
 - `apisix/plugins/ai-proxy/system-one.lua`: the System One client. It sends the request through
   the openai-compatible provider (no client headers forwarded, upstream body never logged), cuts
-  the prompt to 16 KiB at a UTF-8 character boundary, and validates the returned distribution.
+  the prompt to 16 KiB at a UTF-8 character boundary (the API refuses invalid UTF-8), and
+  validates the returned distribution.
 - `ai-proxy-multi.lua`: schema checks, `pick_system_one_instance`, ranked retries in
   `retry_on_error`. `fetch_checkers()` is factored out of `pick_target` so that both pickers share
   the health checks.
