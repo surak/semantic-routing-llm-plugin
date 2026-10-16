@@ -139,5 +139,8 @@ apisix:
 etcd:
   enabled: true
   replicaCount: 1
+  # Persistent etcd: APISIX's routes live in etcd, so without a volume every
+  # etcd restart (including Helm upgrades) would wipe the configuration.
   persistence:
-    enabled: false
+    enabled: true
+    size: 1Gi

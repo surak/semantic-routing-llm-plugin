@@ -16,6 +16,9 @@ What `deploy.sh` does:
    ConfigMap at `/opts/custom_plugins/apisix/plugins/` and adds the plugin to the list;
 5. restarts the APISIX deployment so a changed plugin file is loaded.
 
+etcd keeps its data on a 1 Gi PersistentVolume, so routes survive etcd restarts and
+Helm upgrades. (With persistence off, an upgrade restarts etcd and wipes every route.)
+
 The chart only enables custom plugins when `apisix.plugins` is set, and that list
 replaces APISIX's default list, so `values.yaml` repeats the APISIX 3.19 defaults.
 When upgrading APISIX, regenerate it from `apisix/cli/config.lua` of the new image.
