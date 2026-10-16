@@ -1,0 +1,17 @@
+# End-to-end test stack: APISIX + mock decision model / LLM.
+#   docker compose -f test/docker-compose.yml up -d
+services:
+  mock:
+    image: python:3.12-alpine
+    command: python /mock/mock_server.py
+    volumes:
+      - ./mock_server.py:/mock/mock_server.py:ro
+  apisix:
+    image: apache/apisix:${APISIX_VERSION:-3.19.0-debian}
+    depends_on: [mock]
+    ports:
+      - "${APISIX_PORT:-9080}:9080"
+    volumes:
+      - ../apisix:/opt/ai-decision-router/apisix:ro
+      - ./config.yaml:/usr/local/apisix/conf/config.yaml:ro
+      - ./apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro

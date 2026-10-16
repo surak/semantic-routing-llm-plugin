@@ -1,0 +1,108 @@
+# Routes exercised by test/run_e2e.sh. "mock" is test/mock_server.py.
+x-candidates: &candidates
+  - name: code
+    description: "Programming, debugging and code review."
+    model: mock-coder
+  - name: math
+    description: "Proofs, derivations and quantitative reasoning."
+    model: mock-math
+  - name: general
+    description: "Everything else: chat, writing, summaries."
+    model: mock-general
+x-decision: &decision
+  endpoint: http://mock:9000/v1/systemone
+  model: alias-clef
+  auth:
+    header:
+      Authorization: "Bearer test-token"
+
+routes:
+  # 1. ai-proxy: the plugin rewrites the "model" field of the request
+  - id: single
+    uri: /single
+    plugins:
+      ai-decision-router:
+        decision: *decision
+        candidates: *candidates
+        fallback: general
+      ai-proxy:
+        provider: openai-compatible
+        auth:
+          header:
+            Authorization: "Bearer llm-token"
+        override:
+          endpoint: http://mock:9000/llm/v1/chat/completions
+
+  # 2. ai-proxy-multi: the plugin overrides the balancer's instance choice
+  - id: multi
+    uri: /multi
+    plugins:
+      ai-decision-router:
+        decision: *decision
+        candidates: *candidates
+        fallback: general
+        rewrite_model: false
+      ai-proxy-multi:
+        balancer:
+          algorithm: roundrobin
+        instances:
+          - name: code
+            provider: openai-compatible
+            weight: 1
+            auth: { header: { Authorization: "Bearer a" } }
+            options: { model: inst-code }
+            override: { endpoint: http://mock:9000/inst-code/v1/chat/completions }
+          - name: math
+            provider: openai-compatible
+            weight: 1
+            auth: { header: { Authorization: "Bearer b" } }
+            options: { model: inst-math }
+            override: { endpoint: http://mock:9000/inst-math/v1/chat/completions }
+          - name: general
+            provider: openai-compatible
+            weight: 1
+            auth: { header: { Authorization: "Bearer c" } }
+            options: { model: inst-general }
+            override: { endpoint: http://mock:9000/inst-general/v1/chat/completions }
+
+  # 3. plain HTTP upstream: the rewritten body is forwarded as-is
+  - id: plain
+    uri: /plain
+    plugins:
+      ai-decision-router:
+        decision: *decision
+        candidates: *candidates
+      proxy-rewrite:
+        uri: /plain/v1/chat/completions
+    upstream:
+      type: roundrobin
+      nodes:
+        "mock:9000": 1
+
+  # 4. only route when the client asks for model "auto"
+  - id: trigger
+    uri: /trigger
+    plugins:
+      ai-decision-router:
+        decision: *decision
+        candidates: *candidates
+        trigger_models: ["auto"]
+      ai-proxy:
+        provider: openai-compatible
+        auth: { header: { Authorization: "Bearer llm-token" } }
+        override: { endpoint: http://mock:9000/llm/v1/chat/completions }
+
+  # 5. reject unsure decisions
+  - id: lowconf
+    uri: /lowconf
+    plugins:
+      ai-decision-router:
+        decision: *decision
+        candidates: *candidates
+        fallback: general
+        min_confidence: 0.5
+      ai-proxy:
+        provider: openai-compatible
+        auth: { header: { Authorization: "Bearer llm-token" } }
+        override: { endpoint: http://mock:9000/llm/v1/chat/completions }
+#END
