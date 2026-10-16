@@ -96,7 +96,8 @@ Observed with the live Blablador API (2026-10-16):
    together with `ai-proxy` / `ai-proxy-multi` (see
    [`examples/`](examples/)).
 
-Tested with APISIX 3.19.0 (`apache/apisix:3.19.0-debian`).
+Tested with APISIX 3.19.0 (`apache/apisix:3.19.0-debian`), and on Kubernetes with
+the official Helm chart: see [`deploy/kubernetes/`](deploy/kubernetes/README.md).
 
 ## Configuration
 
@@ -182,13 +183,20 @@ decision model and the LLM, then checks 20 cases: ai-proxy, ai-proxy-multi,
 plain upstream, fallback on decision errors, `min_confidence`,
 `trigger_models`, Responses-API bodies and the decision request itself.
 
+Against a running gateway with real models:
+
+```sh
+python3 test/live_routing.py http://127.0.0.1:9080/v1/chat/completions
+```
+
 ## Repository layout
 
 ```
 apisix/plugins/ai-decision-router.lua   the plugin
 examples/blablador/                     standalone gateway for Blablador (docker compose)
 examples/admin-api-route.sh             same route via the Admin API (etcd mode)
-test/                                   end-to-end tests (docker compose + mock)
+test/                                   end-to-end tests (docker compose + mock), live_routing.py
+deploy/kubernetes/                      Helm values + deploy script for Kubernetes
 docs/ai-decision-router.md              plugin reference (APISIX plugin doc format)
 docs/design.md                          how it hooks into APISIX, design decisions
 site/                                   GitHub Pages homepage + docs viewer (site/build.sh)
