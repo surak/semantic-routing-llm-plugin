@@ -187,3 +187,7 @@ examples/admin-api-route.sh             same route via the Admin API (etcd mode)
 test/                                   end-to-end tests (docker compose + mock)
 docs/design.md                          how it hooks into APISIX, design decisions
 ```
+
+## License
+
+Apache License 2.0 (same as Apache APISIX), see [LICENSE](LICENSE).
