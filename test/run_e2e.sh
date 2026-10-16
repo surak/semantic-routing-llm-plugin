@@ -55,15 +55,22 @@ expect "failing top pick -> next in ranking"      "$r" "path=/math/"
 r=$(chat /retry-threshold auto "fix this bug in my code")
 expect "failing top pick, rest below threshold -> fallback" "$r" "path=/general/"
 
+# a long non-ASCII prompt is cut at a character boundary: the mock, like the
+# real API, rejects invalid UTF-8, which would send the request to the fallback.
+# The 21-byte prefix puts byte 16384 in the middle of a two-byte character.
+long=$(python3 -c 'print("fix this python bug! " + "\u00fc" * 9000)')
+r=$(chat /route auto "$long")
+expect "long UTF-8 prompt is cut cleanly"         "$r" "model=mock-coder"
+
 # OpenAI Responses-style body
-r=$(curl -s "$BASE/route" -H 'Content-Type: application/json' \
+r=$(curl -s "$BASE/route" -H 'Content-Type: application/json' -H 'Cookie: session=secret' \
       -d '{"model":"auto","input":"prove this theorem"}')
 expect "Responses input string is understood"     "$r" "model=mock-math"
 
-# the System One request itself
+# the System One request of the last call, which carried a cookie
 d=$($COMPOSE exec -T mock tail -n 1 /tmp/decisions.jsonl)
 expect "System One call carries auth header"      "$d" '"auth": "Bearer s1-token"'
-expect "System One call uses the model"           "$d" '"model": "jev"'
+expect "System One call uses the model"           "$d" '"model": "jev-latest"'
 expect "System One call is a choice question"     "$d" '"type": "choice"'
 expect "instance descriptions are the criteria"   "$d" '"code": "Programming, debugging and code review."'
 expect "client cookie is not forwarded"           "$d" '"cookie": null'

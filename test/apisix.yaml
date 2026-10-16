@@ -7,7 +7,7 @@ x-instance: &instance
       Authorization: "Bearer llm-token"
 x-system-one: &system_one
   endpoint: http://mock:9000/v1/systemone
-  model: jev
+  model: jev-latest
   auth:
     header:
       Authorization: "Bearer s1-token"
@@ -42,7 +42,8 @@ routes:
             override: { endpoint: http://mock:9000/general/v1/chat/completions }
 
   # 2. the top-ranked instance fails: retry the next one in the ranking
-  #    (threshold 0: every ranked instance is eligible)
+  #    (threshold 0: every ranked instance is eligible). The endpoint has no
+  #    path, so the API's /v1/systemone is used.
   - id: retry
     uri: /retry
     plugins:
@@ -51,6 +52,7 @@ routes:
           algorithm: system_one
         system_one_opts:
           <<: *system_one
+          endpoint: http://mock:9000
           threshold: 0
         fallback_strategy: [http_5xx]
         instances:
