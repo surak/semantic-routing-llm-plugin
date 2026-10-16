@@ -80,9 +80,9 @@ CONTRIBUTING.md asks for an issue before a significant change. Open a feature re
 > - it fails open to `system_one_opts.fallback` when the System One request fails or no available
 >   instance clears `threshold`.
 >
-> It follows the conventions of `semantic`: options in `system_one_opts`, the request goes through
-> the shared provider transport (no client headers forwarded, no upstream body in logs), the
-> answer is validated before use, and `X-AI-System-One-*` debugging headers.
+> It follows the conventions of `semantic`: its options live in `system_one_opts`, the request goes
+> through the shared provider transport (no client headers forwarded, no upstream body in logs),
+> the answer is validated before use, and `X-AI-System-One-*` headers help with debugging.
 >
 > An implementation with Test::Nginx tests and English and Chinese docs is ready:
 > <https://github.com/surak/apisix/tree/feat/ai-proxy-multi-system-one>. It has been tested live
