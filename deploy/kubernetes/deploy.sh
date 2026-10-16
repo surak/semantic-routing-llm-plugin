@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Install APISIX + etcd with ai-decision-router into a Kubernetes cluster.
+# Install APISIX + etcd with the system_one balancer of ai-proxy-multi.
 #
 #   KUBE_CONTEXT=docker-desktop deploy/kubernetes/deploy.sh
 #
-# Re-run after changing the plugin: the ConfigMap is updated and the pods restarted.
+# Re-run after changing overlay/: the ConfigMap is updated and the pods restarted.
 set -euo pipefail
 cd "$(dirname "$0")"
 CTX=${KUBE_CONTEXT:-docker-desktop}
@@ -19,8 +19,10 @@ if ! $K get secret apisix-admin >/dev/null 2>&1; then
     --from-literal=viewer="$(openssl rand -hex 16)"
 fi
 
-$K create configmap ai-decision-router \
-  --from-file=ai-decision-router.lua=../../apisix/plugins/ai-decision-router.lua \
+$K create configmap apisix-system-one \
+  --from-file=ai-proxy-multi.lua=../../overlay/apisix/plugins/ai-proxy-multi.lua \
+  --from-file=schema.lua=../../overlay/apisix/plugins/ai-proxy/schema.lua \
+  --from-file=system-one.lua=../../overlay/apisix/plugins/ai-proxy/system-one.lua \
   --dry-run=client -o yaml | $K apply -f -
 
 helm repo add apisix https://charts.apiseven.com >/dev/null 2>&1 || true
@@ -28,6 +30,6 @@ helm repo update apisix >/dev/null
 helm upgrade --install apisix apisix/apisix --version "${CHART_VERSION:-2.18.2}" \
   --kube-context "$CTX" -n "$NS" -f values.yaml --wait --timeout 10m
 
-# pick up a changed plugin ConfigMap
+# pick up a changed overlay ConfigMap
 $K rollout restart deployment/apisix
 $K rollout status deployment/apisix --timeout 5m

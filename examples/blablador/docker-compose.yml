@@ -1,4 +1,4 @@
-# Blablador auto-routing gateway.
+# Blablador auto-routing gateway (APISIX 3.19 + the system_one overlay).
 #   export BLABLADOR_API_KEY=...      # or put it in examples/blablador/.env
 #   docker compose up -d
 #   curl localhost:9080/v1/chat/completions -H 'Content-Type: application/json' \
@@ -11,6 +11,6 @@ services:
     environment:
       BLABLADOR_API_KEY: ${BLABLADOR_API_KEY:?set BLABLADOR_API_KEY}
     volumes:
-      - ../../apisix:/opt/ai-decision-router/apisix:ro
+      - ../../overlay/apisix:/opt/system-one/apisix:ro
       - ./config.yaml:/usr/local/apisix/conf/config.yaml:ro
       - ./apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro

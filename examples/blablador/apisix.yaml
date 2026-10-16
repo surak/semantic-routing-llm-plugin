@@ -1,14 +1,26 @@
-# Standalone APISIX config: route OpenAI-style chat requests on /v1/chat/completions
-# to the best Blablador model, chosen per request by alias-clef.
+# Standalone APISIX config: OpenAI-style chat requests on /v1/chat/completions
+# are routed to the best of 14 Blablador models by the system_one balancer of
+# ai-proxy-multi, with Blablador's alias-clef as the System One model.
 # Routing roles come from the decision-model-frontend 'LLM router' preset.
 # BLABLADOR_API_KEY is read from the environment (see docker-compose.yml).
+x-blablador: &blablador
+  provider: openai-compatible
+  weight: 1
+  auth:
+    header:
+      Authorization: "Bearer ${{BLABLADOR_API_KEY}}"
+  override:
+    endpoint: https://api.blablador.fz-juelich.de/v1/chat/completions
+
 routes:
   - id: blablador-auto
     uri: /v1/chat/completions
     methods: [POST]
     plugins:
-      ai-decision-router:
-        decision:
+      ai-proxy-multi:
+        balancer:
+          algorithm: system_one
+        system_one_opts:
           endpoint: https://api.blablador.fz-juelich.de/v1/systemone
           model: alias-clef
           timeout: 10000
@@ -16,46 +28,68 @@ routes:
             header:
               Authorization: "Bearer ${{BLABLADOR_API_KEY}}"
           instructions: "Choose the best task fit using the routing roles below. Prefer the specialist matching the main deliverable; use a generalist only when no specialist fits. Respect explicit latency, depth and context needs. Routine tasks do not need the largest model. Names, parameter counts and option order are not quality rankings. Do not default to alias-large for every analytical request or force equal usage when the task does not fit."
-        # route when the client asks for "auto" (or sends no model);
-        # any concrete model name is passed through untouched
-        trigger_models: [auto]
-        fallback: alias-large
-        min_confidence: 0.3
-        candidates:
-          - name: alias-fast
-            description: "Routing role: routine factual questions, short summaries and straightforward scripts without specialist requirements. Prefer for quick general answers; complex specialist work belongs elsewhere."
-          - name: alias-huge
-            description: "Routing role: difficult open-ended architecture and complex agent workflows combining several disciplines. Prefer when ambiguity and coordination dominate; avoid for routine or single-domain tasks."
-          - name: alias-large
-            description: "Routing role: broad multilingual synthesis combining several subjects with no dominant specialist. Prefer balanced general analysis; remote sensing, code, proofs and simple drafting have dedicated routes."
-          - name: alias-code
-            description: "Routing role: debugging existing code, reviewing patches and interpreting screenshots or diagrams while programming. Prefer concrete diagnosis; new large refactors and rapid snippets have other routes."
-          - name: alias-qwen38-quick
-            description: "Routing role: short code snippets, small edits and immediate technical answers under an explicit tight latency budget. Prefer speed over exhaustive analysis; avoid deep debugging or proofs."
-          - name: alias-muse
-            description: "Routing role: personal assistance, friendly conversation, reminders and everyday advice. Prefer a conversational response; avoid technical research or complex programming."
-          - name: alias-eve
-            description: "Routing role: Earth observation, satellite imagery, remote sensing and geoscience. Prefer when scientific domain methods and validation dominate, including land-use analysis and satellite pipelines."
-          - name: alias-glm-5.3-flash
-            description: "Routing role: substantial code generation, implementation and refactoring with clear requirements. Prefer building or restructuring software; existing bug diagnosis has a dedicated route."
-          - name: alias-kimi-k3-1m
-            description: "Routing role: synthesizing very large document collections or navigating many files with long-context dependencies. Prefer when volume and cross-document tracking dominate; verify runtime context before executing."
-          - name: alias-deepseek-v41-flash-booster
-            description: "Routing role: technical math and algorithm reasoning with an explicit throughput requirement. Prefer solving many quantitative problems quickly; formal proofs without a speed constraint have another route."
-          - name: alias-mimo-v2.6-pro
-            description: "Routing role: rigorous mathematical proofs and difficult multi-step reasoning where correctness and depth outweigh latency. Prefer exhaustive derivation; avoid simple tasks or tight response deadlines."
-          - name: alias-mimo-v2.6-flash
-            description: "Routing role: bounded multi-step reasoning, quantitative comparisons and calculations with a moderate response-time budget. Prefer a concise reasoned answer; deep proofs and bulk throughput have other routes."
-          - name: alias-apertus
-            description: "Routing role: German/English institutional writing, multilingual public communication and requests explicitly requiring open-model transparency. Prefer formal language work; do not infer legal compliance from a model choice."
-          - name: alias-aleph-kolibri-1
-            description: "Routing role: plain general chat and first drafts explicitly requesting the local in-house model. Prefer local institutional drafting; specialist science, coding and complex reasoning have other routes."
-      ai-proxy:
-        provider: openai-compatible
-        auth:
-          header:
-            Authorization: "Bearer ${{BLABLADOR_API_KEY}}"
-        override:
-          endpoint: https://api.blablador.fz-juelich.de/v1/chat/completions
+          threshold: 0.3
+          fallback: alias-large
+          # X-AI-System-One-* headers show the ranking; turn off in production
+          debugging: true
+        # retry down the ranking when a model is overloaded or failing
+        fallback_strategy: [http_429, http_5xx]
         timeout: 300000
+        instances:
+          - <<: *blablador
+            name: alias-fast
+            options: { model: alias-fast }
+            description: "Routing role: routine factual questions, short summaries and straightforward scripts without specialist requirements. Prefer for quick general answers; complex specialist work belongs elsewhere."
+          - <<: *blablador
+            name: alias-huge
+            options: { model: alias-huge }
+            description: "Routing role: difficult open-ended architecture and complex agent workflows combining several disciplines. Prefer when ambiguity and coordination dominate; avoid for routine or single-domain tasks."
+          - <<: *blablador
+            name: alias-large
+            options: { model: alias-large }
+            description: "Routing role: broad multilingual synthesis combining several subjects with no dominant specialist. Prefer balanced general analysis; remote sensing, code, proofs and simple drafting have dedicated routes."
+          - <<: *blablador
+            name: alias-code
+            options: { model: alias-code }
+            description: "Routing role: debugging existing code, reviewing patches and interpreting screenshots or diagrams while programming. Prefer concrete diagnosis; new large refactors and rapid snippets have other routes."
+          - <<: *blablador
+            name: alias-qwen38-quick
+            options: { model: alias-qwen38-quick }
+            description: "Routing role: short code snippets, small edits and immediate technical answers under an explicit tight latency budget. Prefer speed over exhaustive analysis; avoid deep debugging or proofs."
+          - <<: *blablador
+            name: alias-muse
+            options: { model: alias-muse }
+            description: "Routing role: personal assistance, friendly conversation, reminders and everyday advice. Prefer a conversational response; avoid technical research or complex programming."
+          - <<: *blablador
+            name: alias-eve
+            options: { model: alias-eve }
+            description: "Routing role: Earth observation, satellite imagery, remote sensing and geoscience. Prefer when scientific domain methods and validation dominate, including land-use analysis and satellite pipelines."
+          - <<: *blablador
+            name: alias-glm-5.3-flash
+            options: { model: alias-glm-5.3-flash }
+            description: "Routing role: substantial code generation, implementation and refactoring with clear requirements. Prefer building or restructuring software; existing bug diagnosis has a dedicated route."
+          - <<: *blablador
+            name: alias-kimi-k3-1m
+            options: { model: alias-kimi-k3-1m }
+            description: "Routing role: synthesizing very large document collections or navigating many files with long-context dependencies. Prefer when volume and cross-document tracking dominate; verify runtime context before executing."
+          - <<: *blablador
+            name: alias-deepseek-v41-flash-booster
+            options: { model: alias-deepseek-v41-flash-booster }
+            description: "Routing role: technical math and algorithm reasoning with an explicit throughput requirement. Prefer solving many quantitative problems quickly; formal proofs without a speed constraint have another route."
+          - <<: *blablador
+            name: alias-mimo-v2.6-pro
+            options: { model: alias-mimo-v2.6-pro }
+            description: "Routing role: rigorous mathematical proofs and difficult multi-step reasoning where correctness and depth outweigh latency. Prefer exhaustive derivation; avoid simple tasks or tight response deadlines."
+          - <<: *blablador
+            name: alias-mimo-v2.6-flash
+            options: { model: alias-mimo-v2.6-flash }
+            description: "Routing role: bounded multi-step reasoning, quantitative comparisons and calculations with a moderate response-time budget. Prefer a concise reasoned answer; deep proofs and bulk throughput have other routes."
+          - <<: *blablador
+            name: alias-apertus
+            options: { model: alias-apertus }
+            description: "Routing role: German/English institutional writing, multilingual public communication and requests explicitly requiring open-model transparency. Prefer formal language work; do not infer legal compliance from a model choice."
+          - <<: *blablador
+            name: alias-aleph-kolibri-1
+            options: { model: alias-aleph-kolibri-1 }
+            description: "Routing role: plain general chat and first drafts explicitly requesting the local in-house model. Prefer local institutional drafting; specialist science, coding and complex reasoning have other routes."
 #END
