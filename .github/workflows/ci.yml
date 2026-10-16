@@ -48,14 +48,38 @@ jobs:
         run: >
           docker run --rm -v /tmp/apisix:/d -w /d pipelinecomponents/luacheck
           luacheck -q apisix/plugins/ai-proxy-multi.lua apisix/plugins/ai-proxy/
+      - name: lj-releng and reindex (APISIX make lint)
+        run: |
+          sudo apt-get install -y -qq luajit >/dev/null
+          cd /tmp/apisix
+          wget -qP utils https://raw.githubusercontent.com/iresty/openresty-devel-utils/master/lj-releng
+          wget -qP utils https://raw.githubusercontent.com/iresty/openresty-devel-utils/master/reindex
+          chmod a+x utils/lj-releng utils/reindex
+          utils/lj-releng apisix/plugins/ai-proxy-multi.lua apisix/plugins/ai-proxy/*.lua > /tmp/lj.log 2>&1 || (cat /tmp/lj.log && exit 1)
+          if grep -E "ERROR.*.lua:" /tmp/lj.log; then exit 1; fi
+          utils/reindex t/plugin/ai-proxy-multi-system-one.t | tee /tmp/reindex.log
+          if grep "done." /tmp/reindex.log; then exit 1; fi
+          bash ./utils/check-plugins-code.sh
+      - name: codespell and eclint (APISIX lint workflow)
+        run: |
+          cd /tmp/apisix
+          pip install -q codespell==2.1.0
+          files="apisix/plugins/ai-proxy-multi.lua apisix/plugins/ai-proxy/schema.lua
+                 apisix/plugins/ai-proxy/system-one.lua t/plugin/ai-proxy-multi-system-one.t
+                 docs/en/latest/plugins/ai-proxy-multi.md docs/zh/latest/plugins/ai-proxy-multi.md"
+          codespell --ignore-words=.ignore_words $files
+          npx -y eclint check $files
       - name: markdownlint (APISIX config)
         run: |
           npm install -g markdownlint-cli@0.25.0
           cd /tmp/apisix && markdownlint docs/en/latest/plugins/ai-proxy-multi.md docs/zh/latest/plugins/ai-proxy-multi.md
-      - name: autocorrect (zh docs)
+      - name: autocorrect and line breaks (zh docs)
         run: |
           npm install -g autocorrect-node
           cd /tmp/apisix && autocorrect --lint docs/zh/latest/plugins/ai-proxy-multi.md
+          sudo pip3 install -q zhon
+          ./utils/fix-zh-doc-segment.py | tee /tmp/zh.log
+          if grep "find broken newline" /tmp/zh.log; then exit 1; fi
       - name: license headers
         run: docker run --rm -v /tmp/apisix:/github/workspace apache/skywalking-eyes header check
 
