@@ -1,0 +1,7 @@
+System One routing for Apache APISIX
+Copyright 2026 Alexandre Strube
+
+The files in overlay/ and patches/ are modified versions of source files of
+Apache APISIX (https://apisix.apache.org/), developed at The Apache Software
+Foundation (http://www.apache.org/) and licensed under the Apache License,
+Version 2.0. They keep their original license headers.

@@ -1,0 +1,1704 @@
+From 7c0625bd3ebc865658efe0b640ed1e3b3ce0b49c Mon Sep 17 00:00:00 2001
+From: Alexandre Strube <a.strube@fz-juelich.de>
+Date: Fri, 16 Oct 2026 13:48:35 +0200
+Subject: [PATCH] feat(ai-proxy-multi): add system_one balancer algorithm
+
+Route each request to the instance a System One model (e.g. TypeSafe
+Jev, Cloudflare Clef) ranks highest. The prompt is sent as the `state`
+of one `choice` question whose options are the instance names, each
+described by the new `instances.description` field; the instances are
+ranked by the returned probability distribution.
+
+Unlike `semantic`, `system_one` skips instances that fail active health
+checks or are rate limited, and on fallback_strategy errors retries down
+the ranking without asking the model again. A failed System One request
+or a ranking below `system_one_opts.threshold` fails open to
+`system_one_opts.fallback`.
+
+The System One request goes through the shared ai-provider layer like
+the embedding request of `semantic`: the client's headers are not
+forwarded, the upstream body is never logged, and non-finite
+probabilities are rejected. `system_one_opts.auth` is encrypted at rest.
+
+The health-checker setup of pick_target is factored into
+fetch_checkers() so both pickers share it.
+---
+ apisix/plugins/ai-proxy-multi.lua        | 215 ++++++-
+ apisix/plugins/ai-proxy/schema.lua       |  92 ++-
+ apisix/plugins/ai-proxy/system-one.lua   | 176 ++++++
+ docs/en/latest/plugins/ai-proxy-multi.md | 151 ++++-
+ docs/zh/latest/plugins/ai-proxy-multi.md | 151 ++++-
+ t/plugin/ai-proxy-multi-system-one.t     | 686 +++++++++++++++++++++++
+ 6 files changed, 1460 insertions(+), 11 deletions(-)
+ create mode 100644 apisix/plugins/ai-proxy/system-one.lua
+ create mode 100644 t/plugin/ai-proxy-multi-system-one.t
+
+diff --git a/apisix/plugins/ai-proxy-multi.lua b/apisix/plugins/ai-proxy-multi.lua
+index 19aba41a..08517c10 100644
+--- a/apisix/plugins/ai-proxy-multi.lua
++++ b/apisix/plugins/ai-proxy-multi.lua
+@@ -26,6 +26,7 @@ local resource = require("apisix.resource")
+ local exporter = require("apisix.plugins.prometheus.exporter")
+ local tonumber = tonumber
+ local pairs = pairs
++local next = next
+ local table_sort = table.sort
+ local table_concat = table.concat
+ local math_random = math.random
+@@ -45,6 +46,7 @@ local url = require("socket.url")
+ local priority_balancer = require("apisix.balancer.priority")
+ local semantic = require("apisix.plugins.ai-proxy.semantic")
+ local embedding = require("apisix.plugins.ai-proxy.embedding")
++local system_one = require("apisix.plugins.ai-proxy.system-one")
+ local ai_protocols = require("apisix.plugins.ai-protocols")
+ local endpoint_regex = "^(https?)://([^:/]+):?(%d*)/?.*$"
+ 
+@@ -68,6 +70,12 @@ local lrucache_semantic_vectors = core.lrucache.new({
+ -- tokens needs a tokenizer, using ~2 bytes/token so the cap stays under the token
+ -- limit even for multi-byte scripts while keeping the whole routing prompt.
+ local MAX_EMBED_PROMPT_BYTES = 16384
++-- The prompt is sent as the System One `state`. Bounded for the same reasons;
++-- System One models accept far longer inputs than embedding models (Jev: 64k
++-- tokens), and the routing signal is in the first part of the prompt anyway.
++local MAX_SYSTEM_ONE_STATE_BYTES = 32768
++-- A System One choice question takes at most this many options.
++local MAX_SYSTEM_ONE_INSTANCES = 64
+ 
+ local plugin_name = "ai-proxy-multi"
+ local _M = {
+@@ -98,6 +106,12 @@ local function fallback_strategy_has(strategy, name)
+ end
+ 
+ 
++local function rate_limiting_enabled(conf)
++    return conf.fallback_strategy == "instance_health_and_rate_limiting" or
++           fallback_strategy_has(conf.fallback_strategy, "rate_limiting")
++end
++
++
+ local function get_chash_key_schema(hash_on)
+     if hash_on == "vars" then
+         return core.schema.upstream_hash_vars_schema
+@@ -255,6 +269,38 @@ function _M.check_schema(conf)
+         end
+     end
+ 
++    if algo == "system_one" then
++        local opts = conf.system_one_opts
++        if not opts then
++            return false, "must configure `system_one_opts` when balancer " ..
++                "algorithm is system_one"
++        end
++        local scheme, host = opts.endpoint:match(endpoint_regex)
++        if not scheme or not host then
++            return false, "invalid `system_one_opts.endpoint`"
++        end
++        if #conf.instances > MAX_SYSTEM_ONE_INSTANCES then
++            return false, "the system_one algorithm supports at most " ..
++                MAX_SYSTEM_ONE_INSTANCES .. " instances"
++        end
++        -- Every instance is an option of the System One question, so each needs
++        -- the criterion the model ranks it by. The fallback is ranked too.
++        local fallback_found = false
++        for _, instance in ipairs(conf.instances) do
++            if opts.fallback and instance.name == opts.fallback then
++                fallback_found = true
++            end
++            if not instance.description then
++                return false, "instance '" .. instance.name ..
++                    "': must configure `description` for the system_one algorithm"
++            end
++        end
++        if opts.fallback and not fallback_found then
++            return false, "`system_one_opts.fallback` names unknown instance '" ..
++                opts.fallback .. "'"
++        end
++    end
++
+     return true
+ end
+ 
+@@ -616,11 +662,13 @@ local function get_instance_conf(instances, name)
+ end
+ 
+ 
+-local function pick_target(ctx, conf, ups_tab)
++-- The health checker of every instance that configures active checks, keyed by
++-- instance name.
++local function fetch_checkers(conf)
+     local checkers = {}
+     local res_conf = resource.fetch_latest_conf(conf._meta.parent.resource_key)
+     if not res_conf then
+-        return nil, nil, "failed to fetch the parent config"
++        return nil, "failed to fetch the parent config"
+     end
+     local instances = res_conf.value.plugins[plugin_name].instances
+     for i, instance in ipairs(conf.instances) do
+@@ -638,6 +686,15 @@ local function pick_target(ctx, conf, ups_tab)
+             checkers[instance.name] = checker
+         end
+     end
++    return checkers
++end
++
++
++local function pick_target(ctx, conf, ups_tab)
++    local checkers, cerr = fetch_checkers(conf)
++    if not checkers then
++        return nil, nil, cerr
++    end
+ 
+     local health_status
+     local version = plugin.conf_version(conf)
+@@ -658,8 +715,7 @@ local function pick_target(ctx, conf, ups_tab)
+     ctx.server_picker = server_picker
+ 
+     local ai_rate_limiting
+-    local check_rate_limiting = conf.fallback_strategy == "instance_health_and_rate_limiting" or
+-                                fallback_strategy_has(conf.fallback_strategy, "rate_limiting")
++    local check_rate_limiting = rate_limiting_enabled(conf)
+     if check_rate_limiting then
+         ai_rate_limiting = require("apisix.plugins.ai-rate-limiting")
+     end
+@@ -891,10 +947,154 @@ local function pick_semantic_instance(ctx, conf)
+ end
+ 
+ 
++-- Ask the System One model once per request and remember the ranking, so
++-- retries walk down it instead of asking again. When there is no usable ranking
++-- (no prompt, request failed, malformed answer) the fallback instance goes first
++-- and the rest follow in configured order.
++local function system_one_ranking(ctx, conf)
++    if ctx.ai_system_one_ranking then
++        return ctx.ai_system_one_ranking
++    end
++
++    local opts = conf.system_one_opts
++    local ranking, err
++    local prompt = extract_last_user_message(ctx)
++    if not prompt then
++        err = "no user message found"
++    else
++        if #prompt > MAX_SYSTEM_ONE_STATE_BYTES then
++            prompt = sub(prompt, 1, MAX_SYSTEM_ONE_STATE_BYTES)
++        end
++        -- pcall: the response is provider-controlled, so a raise here must fall
++        -- back rather than 500.
++        local ok, res, ferr = pcall(system_one.fetch, opts, prompt, conf.instances)
++        if not ok then
++            err = res
++        elseif not res then
++            err = ferr
++        else
++            ranking = res
++        end
++    end
++
++    if ranking then
++        if opts.debugging then
++            local parts = {}
++            for _, c in ipairs(ranking) do
++                parts[#parts + 1] = c.name .. ":" .. str_format("%.4f", c.probability)
++            end
++            core.response.set_header("X-AI-System-One-Probabilities",
++                                     table_concat(parts, ","))
++        end
++    else
++        core.log.warn("system_one routing: ", err, ", falling back")
++        local fallback = opts.fallback or conf.instances[1].name
++        ranking = { { name = fallback, fallback = true } }
++        for _, inst in ipairs(conf.instances) do
++            if inst.name ~= fallback then
++                ranking[#ranking + 1] = { name = inst.name, fallback = true }
++            end
++        end
++    end
++
++    ctx.ai_system_one_ranking = ranking
++    ctx.ai_system_one_tried = {}
++    return ranking
++end
++
++
++-- Pick the most probable instance that is healthy, not rate limited, not tried
++-- yet in this request and clears the threshold; else the first available one in
++-- fallback order.
++local function pick_system_one_instance(ctx, conf)
++    local opts = conf.system_one_opts
++    local ranking = system_one_ranking(ctx, conf)
++    local tried = ctx.ai_system_one_tried
++
++    local checkers, cerr = fetch_checkers(conf)
++    if not checkers then
++        return nil, nil, cerr
++    end
++    local health_status
++    if next(checkers) then
++        health_status = fetch_health_status(conf, checkers, ctx.matched_route.key,
++                                            plugin.conf_version(conf))
++    end
++    local ai_rate_limiting
++    if rate_limiting_enabled(conf) then
++        ai_rate_limiting = require("apisix.plugins.ai-rate-limiting")
++    end
++
++    local function available(name)
++        if tried[name] then
++            return false
++        end
++        if health_status and health_status[name] == false then
++            core.log.warn("system_one routing: instance ", name, " is unhealthy")
++            return false
++        end
++        if ai_rate_limiting and
++           not ai_rate_limiting.check_instance_status(nil, ctx, name) then
++            core.log.warn("system_one routing: instance ", name, " is rate limited")
++            return false
++        end
++        return true
++    end
++
++    local picked
++    for _, cand in ipairs(ranking) do
++        if not cand.fallback and cand.probability >= opts.threshold
++           and available(cand.name)
++        then
++            picked = cand.name
++            break
++        end
++    end
++
++    if not picked then
++        -- nothing (left) cleared the threshold: fallback first, then the rest
++        local retrying = next(tried) ~= nil
++        local order = { opts.fallback or conf.instances[1].name }
++        for _, inst in ipairs(conf.instances) do
++            order[#order + 1] = inst.name
++        end
++        for _, name in ipairs(order) do
++            if available(name) then
++                picked = name
++                break
++            end
++        end
++        if picked and not ranking[1].fallback then
++            core.log.warn("system_one routing: no ", retrying and "untried " or "",
++                          "available instance cleared the threshold, falling back to ",
++                          picked)
++        end
++    end
++
++    if not picked then
++        return nil, nil, "all servers tried"
++    end
++    tried[picked] = true
++
++    if opts.debugging then
++        core.response.set_header("X-AI-System-One-Picked-Instance", picked)
++    end
++    core.log.info("system_one routing picked instance: ", picked)
++
++    local instance_conf = get_instance_conf(conf.instances, picked)
++    local nodes = instance_conf._healthy_dns_nodes or instance_conf._dns_nodes
++    use_node_for_request(instance_conf, pick_request_node(nodes))
++    return picked, instance_conf
++end
++
++
+ local function pick_ai_instance(ctx, conf, ups_tab)
+     local instance_name, instance_conf, err
+-    if conf.balancer and conf.balancer.algorithm == "semantic" then
++    local algorithm = conf.balancer and conf.balancer.algorithm
++    if algorithm == "semantic" then
+         instance_name, instance_conf = pick_semantic_instance(ctx, conf)
++    elseif algorithm == "system_one" then
++        instance_name, instance_conf, err = pick_system_one_instance(ctx, conf)
+     elseif #conf.instances == 1 then
+         instance_name = conf.instances[1].name
+         instance_conf = conf.instances[1]
+@@ -937,10 +1137,11 @@ end
+ 
+ 
+ local function retry_on_error(ctx, conf, code, body)
+-    if not ctx.server_picker then
++    if ctx.server_picker then
++        ctx.server_picker.after_balance(ctx, true)
++    elseif not ctx.ai_system_one_ranking then
+         return code
+     end
+-    ctx.server_picker.after_balance(ctx, true)
+     if (code == 429 and fallback_strategy_has(conf.fallback_strategy, "http_429")) or
+        (code >= 500 and code < 600 and
+        fallback_strategy_has(conf.fallback_strategy, "http_5xx")) or
+diff --git a/apisix/plugins/ai-proxy/schema.lua b/apisix/plugins/ai-proxy/schema.lua
+index 78787a77..0e671f06 100644
+--- a/apisix/plugins/ai-proxy/schema.lua
++++ b/apisix/plugins/ai-proxy/schema.lua
+@@ -224,6 +224,16 @@ local ai_instance_schema = {
+                 description = "Per-instance minimum cosine similarity for the "
+                     .. "semantic algorithm; overrides semantic_opts.threshold.",
+             },
++            description = {
++                type = "string",
++                minLength = 1,
++                maxLength = 4096,
++                description = "Routing role of this instance for the system_one "
++                    .. "algorithm: which requests it should receive, in plain "
++                    .. "language. Sent to the System One model as the criterion "
++                    .. "of this instance's option. Required for every instance "
++                    .. "when the balancer algorithm is system_one.",
++            },
+         },
+         required = {"name", "provider", "auth", "weight"},
+     },
+@@ -312,6 +322,76 @@ local semantic_opts_schema = {
+     required = { "embeddings" },
+ }
+ 
++-- All options specific to the system_one balancer.
++local system_one_opts_schema = {
++    type = "object",
++    properties = {
++        endpoint = {
++            type = "string",
++            pattern = [[^https?://]],
++            description = "Full URL of the System One API, e.g. "
++                .. "https://api.example.com/v1/systemone.",
++        },
++        model = {
++            type = "string",
++            minLength = 1,
++            description = "System One model that ranks the instances, e.g. jev.",
++        },
++        auth = {
++            type = "object",
++            properties = {
++                header = { type = "object", additionalProperties = { type = "string" } },
++                query = { type = "object", additionalProperties = { type = "string" } },
++            },
++            -- header/query only, as for semantic_opts.embeddings: the call runs
++            -- outside the client request, so ctx-dependent schemes cannot work.
++            additionalProperties = false,
++        },
++        instructions = {
++            type = "string",
++            minLength = 1,
++            description = "Instructions of the routing question. Defaults to a "
++                .. "generic instruction to pick the best-suited instance.",
++        },
++        threshold = {
++            type = "number",
++            minimum = 0,
++            maximum = 1,
++            default = 0,
++            description = "Minimum probability the System One model must assign "
++                .. "to an instance for it to be picked. When no available "
++                .. "instance clears it, the request goes to the `fallback` "
++                .. "instance, or the first instance if none is named.",
++        },
++        fallback = {
++            type = "string",
++            minLength = 1,
++            description = "Name of the instance to route to when the System One "
++                .. "request fails or no instance clears the threshold. It is "
++                .. "otherwise a normal ranked instance and needs a `description` "
++                .. "like the rest. Defaults to the first instance when unset.",
++        },
++        timeout = {
++            type = "integer",
++            minimum = 1,
++            default = 3000,
++            description = "System One request timeout in milliseconds. The call "
++                .. "is made synchronously on every request, so this bounds the "
++                .. "latency added when the endpoint is slow or down (the request "
++                .. "then fails open to the fallback).",
++        },
++        ssl_verify = { type = "boolean", default = true },
++        debugging = {
++            type = "boolean",
++            default = false,
++            description = "When true, expose the per-instance probabilities and "
++                .. "the picked instance via X-AI-System-One-* response headers, "
++                .. "for debugging.",
++        },
++    },
++    required = { "endpoint", "model" },
++}
++
+ local logging_schema = {
+     type = "object",
+     properties = {
+@@ -407,7 +487,7 @@ _M.ai_proxy_multi_schema = {
+             properties = {
+                 algorithm = {
+                     type = "string",
+-                    enum = { "chash", "roundrobin", "semantic" },
++                    enum = { "chash", "roundrobin", "semantic", "system_one" },
+                     description = "Load-balancing algorithm. Note: 'semantic' "
+                         .. "picks an instance by prompt similarity and does not "
+                         .. "participate in health checks or fallback_strategy / "
+@@ -415,7 +495,12 @@ _M.ai_proxy_multi_schema = {
+                         .. "returned to the client. It only falls back (to the "
+                         .. "semantic_opts.fallback, else the first instance) when "
+                         .. "no instance clears its threshold or embedding fails. "
+-                        .. "Configure it under `semantic_opts`.",
++                        .. "Configure it under `semantic_opts`. 'system_one' asks "
++                        .. "a System One model to rank the instances by their "
++                        .. "`description`, picks the most probable available "
++                        .. "instance, and retries down the ranking on "
++                        .. "fallback_strategy errors. Configure it under "
++                        .. "`system_one_opts`.",
+                 },
+                 hash_on = {
+                     type = "string",
+@@ -437,6 +522,7 @@ _M.ai_proxy_multi_schema = {
+         },
+         instances = ai_instance_schema,
+         semantic_opts = semantic_opts_schema,
++        system_one_opts = system_one_opts_schema,
+         logging = logging_schema,
+         fallback_strategy = {
+             anyOf = {
+@@ -555,6 +641,8 @@ _M.ai_proxy_multi_schema = {
+         "instances.auth.aws.session_token",
+         "semantic_opts.embeddings.auth.header",
+         "semantic_opts.embeddings.auth.query",
++        "system_one_opts.auth.header",
++        "system_one_opts.auth.query",
+     },
+ }
+ 
+diff --git a/apisix/plugins/ai-proxy/system-one.lua b/apisix/plugins/ai-proxy/system-one.lua
+new file mode 100644
+index 00000000..f760831f
+--- /dev/null
++++ b/apisix/plugins/ai-proxy/system-one.lua
+@@ -0,0 +1,176 @@
++--
++-- Licensed to the Apache Software Foundation (ASF) under one or more
++-- contributor license agreements.  See the NOTICE file distributed with
++-- this work for additional information regarding copyright ownership.
++-- The ASF licenses this file to You under the Apache License, Version 2.0
++-- (the "License"); you may not use this file except in compliance with
++-- the License.  You may obtain a copy of the License at
++--
++--     http://www.apache.org/licenses/LICENSE-2.0
++--
++-- Unless required by applicable law or agreed to in writing, software
++-- distributed under the License is distributed on an "AS IS" BASIS,
++-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++-- See the License for the specific language governing permissions and
++-- limitations under the License.
++--
++
++-- Client for the System One API, used by the system_one balancer of
++-- ai-proxy-multi. A System One model (e.g. TypeSafe Jev, Cloudflare Clef) is a
++-- discriminative model: given a `state` and typed questions it returns one
++-- probability distribution per question instead of generated text. The balancer
++-- asks a single `choice` question whose options are the instance names, with
++-- each instance's `description` as the option's criterion, and ranks the
++-- instances by the returned probabilities.
++--
++-- Like the embedding client, the request goes through the shared ai-provider
++-- layer, so endpoint parsing, auth and HTTP transport match the chat path, and
++-- none of the client's headers are forwarded.
++local core = require("apisix.core")
++local ipairs = ipairs
++local pairs = pairs
++local type = type
++local tostring = tostring
++local require = require
++local INF = math.huge
++
++local _M = {}
++
++-- Id of the single question sent to the System One model.
++local QUESTION = "instance"
++_M.QUESTION = QUESTION
++
++local DEFAULT_INSTRUCTIONS = "Choose the option best suited to answer this "
++    .. "request. Prefer the option whose criteria match the main task; options "
++    .. "are not ordered by quality."
++
++
++local function valid_probability(p)
++    return type(p) == "number" and p == p and p ~= INF and p ~= -INF
++           and p >= 0 and p <= 1
++end
++
++
++function _M.build_request(opts, state, instances)
++    local criteria = {}
++    for _, inst in ipairs(instances) do
++        criteria[inst.name] = inst.description
++    end
++    return {
++        model = opts.model,
++        state = state,
++        questions = {
++            [QUESTION] = {
++                type = "choice",
++                instructions = opts.instructions or DEFAULT_INSTRUCTIONS,
++                criteria = criteria,
++            },
++        },
++    }
++end
++
++
++-- Turn the answer to our question into a ranking: an array of
++-- { name = instance name, probability = number }, most probable first. Ties keep
++-- the configured instance order. Options the model returns that are not
++-- instances are ignored; instances it omits get probability 0.
++--
++-- The API returns the probability distribution itself; any derived `choice` or
++-- `confidence` is computed from it, so the distribution is all we rely on. An
++-- answer without one but with a `choice` ranks that choice first.
++function _M.rank(answer, instances)
++    if type(answer) ~= "table" then
++        return nil, "no answer for question '" .. QUESTION .. "'"
++    end
++
++    local probs = answer.probabilities
++    if probs ~= nil and type(probs) ~= "table" then
++        return nil, "invalid probabilities"
++    end
++
++    local by_name = {}
++    local have_any = false
++    if probs then
++        for name, p in pairs(probs) do
++            if type(name) == "string" then
++                if not valid_probability(p) then
++                    return nil, "invalid probability for option '" .. name .. "'"
++                end
++                by_name[name] = p
++            end
++        end
++    end
++    for _, inst in ipairs(instances) do
++        if by_name[inst.name] then
++            have_any = true
++        end
++    end
++
++    if not have_any then
++        local choice = answer.choice
++        if type(choice) ~= "string" then
++            return nil, "answer has neither probabilities nor a choice"
++        end
++        local confidence = answer.confidence
++        by_name[choice] = valid_probability(confidence) and confidence or 1
++    end
++
++    local ranking = {}
++    for i, inst in ipairs(instances) do
++        ranking[#ranking + 1] = {
++            name = inst.name,
++            probability = by_name[inst.name] or 0,
++            order = i,
++        }
++    end
++    core.table.sort(ranking, function(a, b)
++        if a.probability ~= b.probability then
++            return a.probability > b.probability
++        end
++        return a.order < b.order
++    end)
++
++    if ranking[1].probability == 0 then
++        return nil, "the model chose none of the instances"
++    end
++    return ranking
++end
++
++
++-- Ask the System One model to rank `instances` for `state`.
++-- Returns the ranking (see rank()) or nil + err.
++function _M.fetch(opts, state, instances)
++    -- The endpoint is the full URL of the System One API (it carries its own
++    -- path), so the generic OpenAI-compatible provider is only used for its
++    -- transport and auth handling.
++    local ai_provider = require("apisix.plugins.ai-providers.openai-compatible")
++    local extra_opts = {
++        endpoint = opts.endpoint,
++        auth = opts.auth,
++    }
++    local req_conf = {
++        ssl_verify = opts.ssl_verify ~= false,
++        timeout = opts.timeout or 3000,
++        keepalive = true,
++    }
++    local status, raw_body, err = ai_provider:request(req_conf,
++        _M.build_request(opts, state, instances), extra_opts)
++
++    -- Never log or return the upstream body: it is third-party content that may
++    -- echo the prompt back or forge log lines.
++    if status ~= 200 then
++        if err then
++            return nil, "system one request failed: " .. err
++        end
++        return nil, "system one endpoint returned status " .. tostring(status)
++    end
++
++    local data, derr = core.json.decode(raw_body)
++    if type(data) ~= "table" or type(data.answers) ~= "table" then
++        return nil, "invalid system one response: " .. (derr or "unexpected shape")
++    end
++    return _M.rank(data.answers[QUESTION], instances)
++end
++
++
++return _M
+diff --git a/docs/en/latest/plugins/ai-proxy-multi.md b/docs/en/latest/plugins/ai-proxy-multi.md
+index 2246fe8a..07b6ed28 100644
+--- a/docs/en/latest/plugins/ai-proxy-multi.md
++++ b/docs/en/latest/plugins/ai-proxy-multi.md
+@@ -72,7 +72,7 @@ When an instance's `provider` is set to `bedrock`, the Plugin expects requests i
+ | max_retries                        | integer        | False    |                                   | greater or equal to 0 | Maximum number of fallback retries after the initial request fails. Bounds how many additional instances a single request tries, so it does not exhaust every configured instance. Only takes effect together with `fallback_strategy` or `fallback_http_statuses`. When unset, the Plugin retries until an instance succeeds or all are tried. |
+ | retry_on_failure_within_ms         | integer        | False    |                                   | greater or equal to 1 | Only fall back to another instance when the upstream fails within this many milliseconds. Fast failures (such as connection errors or quick `429`/`5xx`) are retried, while a slow failure that takes longer than this is returned to the client directly to avoid doubling the wait time. Only takes effect together with `fallback_strategy` or `fallback_http_statuses`. When unset, the Plugin retries regardless of how long the failed attempt took. |
+ | balancer                           | object         | False    |                                   |              | Load balancing configurations. |
+-| balancer.algorithm                 | string         | False    | roundrobin                     | [roundrobin, chash, semantic] | Load balancing algorithm. When set to `roundrobin`, weighted round robin algorithm is used. When set to `chash`, consistent hashing algorithm is used. When set to `semantic`, the Plugin picks an instance by the semantic similarity between the request prompt and each instance's `examples`, and its options are configured under `semantic_opts`. Note that `semantic` does not participate in health checks or `fallback_strategy` / retry — an upstream failure on the chosen instance is returned to the client; it only falls back (to the `semantic_opts.fallback` instance, else the first instance) when no instance clears its threshold or embedding fails. |
++| balancer.algorithm                 | string         | False    | roundrobin                     | [roundrobin, chash, semantic, system_one] | Load balancing algorithm. When set to `roundrobin`, weighted round robin algorithm is used. When set to `chash`, consistent hashing algorithm is used. When set to `semantic`, the Plugin picks an instance by the semantic similarity between the request prompt and each instance's `examples`, and its options are configured under `semantic_opts`. Note that `semantic` does not participate in health checks or `fallback_strategy` / retry — an upstream failure on the chosen instance is returned to the client; it only falls back (to the `semantic_opts.fallback` instance, else the first instance) when no instance clears its threshold or embedding fails. When set to `system_one`, the Plugin asks a System One model to rank the instances by their `description` and picks the most probable available instance; its options are configured under `system_one_opts`. Unlike `semantic`, `system_one` skips instances that fail health checks or are rate limited, and retries down the ranking on `fallback_strategy` errors. |
+ | balancer.hash_on                   | string         | False    |                                   | [vars, headers, cookie, consumer, vars_combinations] | Used when `type` is `chash`. Support hashing on [NGINX variables](https://nginx.org/en/docs/varindex.html), headers, cookie, consumer, or a combination of [NGINX variables](https://nginx.org/en/docs/varindex.html). |
+ | balancer.key                       | string         | False    |                                   |              | Used when `type` is `chash`. When `hash_on` is set to `header` or `cookie`, `key` is required. When `hash_on` is set to `consumer`, `key` is not required as the consumer name will be used as the key automatically. |
+ | instances                          | array[object]  | True     |                                   |              | LLM instance configurations. |
+@@ -98,6 +98,7 @@ When an instance's `provider` is set to `bedrock`, the Plugin expects requests i
+ | instances.options.model             | string         | False    |                                   |              | Name of the LLM model, such as `gpt-4` or `gpt-3.5`. See your LLM provider's API documentation for more available models. For Bedrock, this can be a foundation model ID (e.g., `anthropic.claude-3-5-sonnet-20240620-v1:0`), a cross-region inference profile ID (e.g., `us.anthropic.claude-3-5-sonnet-20240620-v1:0`), or an application inference profile ARN (e.g., `arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123`). |
+ | instances.examples                  | array[string]  | False    |                                   | 1 to 64 items | Used when `algorithm` is `semantic`. Example utterances representing this instance's intent; each is embedded into its own reference vector. Required for every instance when `algorithm` is `semantic`, including the one named by `semantic_opts.fallback`. |
+ | instances.threshold                 | number         | False    |                                   | -1 to 1      | Used when `algorithm` is `semantic`. Per-instance minimum cosine similarity; overrides `semantic_opts.threshold`. |
++| instances.description               | string         | False    |                                   | 1 to 4096 characters | Used when `algorithm` is `system_one`. Routing role of the instance in plain language, for example `Debugging existing code and reviewing patches.` It is sent to the System One model as the criterion of the instance's option. Required for every instance when `algorithm` is `system_one`, including the one named by `system_one_opts.fallback`. |
+ | logging                             | object         | False    |                                   |              | Logging configurations. |
+ | logging.summaries                   | boolean        | False    | false                           |              | If true, log request LLM model, duration, request, and response tokens. |
+ | logging.payloads                    | boolean        | False    | false                           |              | If true, log request and response payload. |
+@@ -138,6 +139,18 @@ When an instance's `provider` is set to `bedrock`, the Plugin expects requests i
+ | semantic_opts.embeddings.auth.query | object         | False    |                                   |              | Authentication query parameters. Encrypted at rest. |
+ | semantic_opts.embeddings.timeout    | integer        | False    | 3000                            | minimum = 1  | Embedding request timeout in milliseconds. The query prompt is embedded synchronously on every request, so this bounds the latency added to each request when the embedding endpoint is slow or down (the request then fails open to the fallback). |
+ | semantic_opts.embeddings.ssl_verify | boolean        | False    | true                            |              | If true, verify the embedding service's certificate. |
++| system_one_opts                     | object         | False    |                                   |              | Options for the `system_one` balancer. Required when `balancer.algorithm` is `system_one`. |
++| system_one_opts.endpoint            | string         | True     |                                   |              | Full URL of the System One API, for example `https://api.example.com/v1/systemone`. |
++| system_one_opts.model               | string         | True     |                                   |              | System One model that ranks the instances, for example `jev`. |
++| system_one_opts.auth                | object         | False    |                                   |              | Authentication configurations for the System One API. |
++| system_one_opts.auth.header         | object         | False    |                                   |              | Authentication headers. Encrypted at rest. |
++| system_one_opts.auth.query          | object         | False    |                                   |              | Authentication query parameters. Encrypted at rest. |
++| system_one_opts.instructions        | string         | False    |                                   |              | Instructions of the routing question. Defaults to a generic instruction to pick the best-suited instance. |
++| system_one_opts.threshold           | number         | False    | 0                               | 0 to 1       | Minimum probability the System One model must assign to an instance for it to be picked. When no available instance clears it, the request goes to the `fallback` instance, or the first instance if none is named. This also applies to retries: a retry goes to the next instance in the ranking only if it clears the threshold, else to the `fallback` instance. |
++| system_one_opts.fallback            | string         | False    |                                   |              | Name of the instance to route to when the System One request fails or no instance clears the threshold. It is otherwise a normal ranked instance and needs a `description` like the rest. Defaults to the first instance when unset. |
++| system_one_opts.timeout             | integer        | False    | 3000                            | minimum = 1  | System One request timeout in milliseconds. The request is made synchronously for every client request, so this bounds the latency added when the endpoint is slow or down (the request then fails open to the fallback). |
++| system_one_opts.ssl_verify          | boolean        | False    | true                            |              | If true, verify the System One API's certificate. |
++| system_one_opts.debugging           | boolean        | False    | false                           |              | If true, expose the per-instance probabilities and the routing decision via `X-AI-System-One-Probabilities` and `X-AI-System-One-Picked-Instance` response headers, for debugging. |
+ | timeout                             | integer        | False    | 30000                           | greater than or equal to 1 | Request timeout in milliseconds when requesting the LLM service. Applied per socket operation (connect / send / read block); does not cap the total duration of a streaming response. |
+ | max_req_body_size                   | integer        | False    | 67108864                        | greater than or equal to 1 | Maximum request body size in bytes that the plugin reads into memory. Requests whose body exceeds this limit are rejected with `413`. Prevents unbounded memory buffering of large request bodies. |
+ | max_stream_duration_ms              | integer        | False    |                                 | greater than or equal to 1 | Maximum wall-clock duration (in milliseconds) for a streaming AI response. If the upstream keeps sending data past this deadline, the gateway closes the connection. Unset means no cap. Use this to protect the gateway from upstream bugs that produce tokens indefinitely. When the limit is hit mid-stream, the downstream SSE stream is truncated (no protocol-specific terminator such as `[DONE]`, `message_stop`, or `response.completed`); well-behaved clients should treat a missing terminator as an incomplete response. |
+@@ -3151,3 +3164,139 @@ semantic routing: no instance cleared threshold (scores: code:0.3057,translate:0
+ If the headers are missing entirely while `debugging` is on, the embedding step itself failed and the request was served by the fallback before any score was computed; the reason is logged at `warn`.
+ 
+ Because `debugging` reveals instance names to the caller, keep it off in production and rely on the log line instead.
++
++### Route with a System One Model
++
++The following example demonstrates how you can use the `system_one` algorithm to let a System One model pick the instance for each request. A System One model, such as [TypeSafe Jev](https://en.wikipedia.org/wiki/Jev_(AI_model)) or Cloudflare Clef, is a discriminative model: instead of generating text, it answers typed questions about an input with a probability distribution. The Plugin sends the request prompt as the `state` and asks one `choice` question whose options are the instance names, each described by the instance's `description`. It then forwards the request to the most probable instance that is healthy and not rate limited.
++
++Compared with `semantic`, the routing policy is a plain-language description of each instance rather than a set of example prompts, and no embedding model is needed. Because the model ranks every instance, the Plugin can skip unhealthy or rate-limited instances and retry on the next most probable instance.
++
++Create a Route as such and update the LLM providers, System One endpoint and model, and API keys accordingly. The `default` instance is named as the `system_one_opts.fallback`, used when the System One request fails or no instance clears the threshold:
++
++```shell
++curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
++  -H "X-API-KEY: ${admin_key}" \
++  -d '{
++    "id": "ai-proxy-multi-route",
++    "uri": "/anything",
++    "methods": ["POST"],
++    "plugins": {
++      "ai-proxy-multi": {
++        "balancer": {
++          "algorithm": "system_one"
++        },
++        "system_one_opts": {
++          "endpoint": "https://api.example.com/v1/systemone",
++          "model": "jev",
++          "auth": {
++            "header": {
++              "Authorization": "Bearer '"$YOUR_SYSTEM_ONE_API_KEY"'"
++            }
++          },
++          "threshold": 0.3,
++          "fallback": "default"
++        },
++        "fallback_strategy": ["http_429", "http_5xx"],
++        "instances": [
++          {
++            "name": "code",
++            "provider": "openai",
++            "weight": 1,
++            "auth": {
++              "header": {
++                "Authorization": "Bearer '"$YOUR_LLM_API_KEY"'"
++              }
++            },
++            "options": {
++              "model": "gpt-4o"
++            },
++            "description": "Writing, debugging and reviewing code."
++          },
++          {
++            "name": "translate",
++            "provider": "openai",
++            "weight": 1,
++            "auth": {
++              "header": {
++                "Authorization": "Bearer '"$YOUR_LLM_API_KEY"'"
++              }
++            },
++            "options": {
++              "model": "gpt-4o-mini"
++            },
++            "description": "Translating and summarizing text."
++          },
++          {
++            "name": "default",
++            "provider": "openai",
++            "weight": 1,
++            "auth": {
++              "header": {
++                "Authorization": "Bearer '"$YOUR_LLM_API_KEY"'"
++              }
++            },
++            "options": {
++              "model": "gpt-4o-mini"
++            },
++            "description": "General questions and conversation with no specialist need."
++          }
++        ]
++      }
++    }
++  }'
++```
++
++Send a request with a programming prompt:
++
++```shell
++curl "http://127.0.0.1:9080/anything" -X POST \
++  -H "Content-Type: application/json" \
++  -d '{
++    "model": "auto",
++    "messages": [
++      { "role": "user", "content": "help me debug this python code" }
++    ]
++  }'
++```
++
++The request should be routed to the `code` instance and served by `gpt-4o`. If the `code` instance answers with a `5xx` or `429` status, the request is retried on the next most probable instance that clears `threshold`, or else on the `default` fallback instance, without asking the System One model again.
++
++The Plugin sends the System One API a request similar to the following:
++
++```json
++{
++  "model": "jev",
++  "state": "help me debug this python code",
++  "questions": {
++    "instance": {
++      "type": "choice",
++      "instructions": "Choose the option best suited to answer this request. ...",
++      "criteria": {
++        "code": "Writing, debugging and reviewing code.",
++        "translate": "Translating and summarizing text.",
++        "default": "General questions and conversation with no specialist need."
++      }
++    }
++  }
++}
++```
++
++It ranks the instances by `answers.instance.probabilities` in the response. If the response carries no probabilities, the Plugin uses `answers.instance.choice` instead.
++
++#### Debugging the routing decision
++
++Set `system_one_opts.debugging` to `true` to have the Plugin report the probability of each instance and which one it picked:
++
++```text
++HTTP/1.1 200 OK
++X-AI-System-One-Picked-Instance: code
++X-AI-System-One-Probabilities: code:0.9100,default:0.0600,translate:0.0300
++```
++
++When the System One request fails, or no available instance clears the threshold, the Plugin logs the reason at `warn` level and routes to the fallback instance:
++
++```text
++system_one routing: system one request failed: request: timeout, falling back
++```
++
++Because `debugging` reveals instance names to the caller, keep it off in production and rely on the log lines instead.
+diff --git a/docs/zh/latest/plugins/ai-proxy-multi.md b/docs/zh/latest/plugins/ai-proxy-multi.md
+index db6e43e1..0cf2c1b9 100644
+--- a/docs/zh/latest/plugins/ai-proxy-multi.md
++++ b/docs/zh/latest/plugins/ai-proxy-multi.md
+@@ -72,7 +72,7 @@ import TabItem from '@theme/TabItem';
+ | max_retries                        | integer        | 否    |                                   | 大于或等于 0 | 初始请求失败后允许的最大故障转移重试次数。用于限制单个请求最多尝试多少个额外实例，避免穷举所有已配置的实例。仅在配置 `fallback_strategy` 或 `fallback_http_statuses` 时生效。未设置时，插件会持续重试直到某个实例成功或所有实例都已尝试。 |
+ | retry_on_failure_within_ms         | integer        | 否    |                                   | 大于或等于 1 | 仅当上游在指定毫秒数内失败时才故障转移到其他实例。快速失败（如连接错误、快速返回的 `429`/`5xx`）会触发重试，而耗时超过该值的慢失败会直接将错误返回给客户端，避免客户端等待时间翻倍。仅在配置 `fallback_strategy` 或 `fallback_http_statuses` 时生效。未设置时，插件无论失败请求耗时多久都会重试。 |
+ | balancer                           | object         | 否    |                                   |              | 负载均衡配置。 |
+-| balancer.algorithm                 | string         | 否    | roundrobin                     | [roundrobin, chash, semantic] | 负载均衡算法。设置为 `roundrobin` 时，使用加权轮询算法。设置为 `chash` 时，使用一致性哈希算法。设置为 `semantic` 时，插件根据请求提示词与各实例 `examples` 之间的语义相似度选择实例，其相关选项配置在 `semantic_opts` 下。注意：`semantic` 不参与健康检查，也不参与 `fallback_strategy` / 重试——被选中实例的上游失败会直接返回给客户端；只有当没有实例达到其阈值或嵌入请求失败时，才会回退（回退到 `semantic_opts.fallback` 实例，若未配置则回退到第一个实例）。 |
++| balancer.algorithm                 | string         | 否    | roundrobin                     | [roundrobin, chash, semantic, system_one] | 负载均衡算法。设置为 `roundrobin` 时，使用加权轮询算法。设置为 `chash` 时，使用一致性哈希算法。设置为 `semantic` 时，插件根据请求提示词与各实例 `examples` 之间的语义相似度选择实例，其相关选项配置在 `semantic_opts` 下。注意：`semantic` 不参与健康检查，也不参与 `fallback_strategy` / 重试——被选中实例的上游失败会直接返回给客户端；只有当没有实例达到其阈值或嵌入请求失败时，才会回退（回退到 `semantic_opts.fallback` 实例，若未配置则回退到第一个实例）。设置为 `system_one` 时，插件请 System One 模型根据各实例的 `description` 对实例进行排序，并选择概率最高的可用实例，其相关选项配置在 `system_one_opts` 下。与 `semantic` 不同，`system_one` 会跳过健康检查失败或被限流的实例，并在出现 `fallback_strategy` 错误时按排序重试下一个实例。 |
+ | balancer.hash_on                   | string         | 否    |                                   | [vars, headers, cookie, consumer, vars_combinations] | 当 `type` 为 `chash` 时使用。支持基于 [NGINX 变量](https://nginx.org/en/docs/varindex.html)、标头、cookie、消费者或 [NGINX 变量](https://nginx.org/en/docs/varindex.html)组合进行哈希。 |
+ | balancer.key                       | string         | 否    |                                   |              | 当 `type` 为 `chash` 时使用。当 `hash_on` 设置为 `header` 或 `cookie` 时，需要 `key`。当 `hash_on` 设置为 `consumer` 时，不需要 `key`，因为消费者名称将自动用作键。 |
+ | instances                          | array[object]  | 是     |                                   |              | LLM 实例配置。 |
+@@ -104,6 +104,7 @@ import TabItem from '@theme/TabItem';
+ | instances.override.request_body_force_override | boolean | 否 | false |                            | 为 `false`（默认）时，客户端请求体中的字段优先，`instances.override.request_body` 仅补充缺失字段。为 `true` 时，`instances.override.request_body` 的值强制覆盖客户端请求体中的同名字段。不影响 `instances.override.llm_options`。 |
+ | instances.examples                  | array[string]  | 否    |                                   | 1 到 64 项 | 当 `algorithm` 为 `semantic` 时使用。代表该实例意图的示例语句；每一条都会被嵌入为独立的参考向量。当 `algorithm` 为 `semantic` 时每个实例都必填，包括被 `semantic_opts.fallback` 指定的实例。 |
+ | instances.threshold                 | number         | 否    |                                   | -1 到 1      | 当 `algorithm` 为 `semantic` 时使用。该实例的最小余弦相似度，覆盖 `semantic_opts.threshold`。 |
++| instances.description               | string         | 否    |                                   | 1 到 4096 个字符 | 当 `algorithm` 为 `system_one` 时使用。用自然语言描述的实例路由角色，例如 `Debugging existing code and reviewing patches.`。它会作为该实例选项的判断标准发送给 System One 模型。当 `algorithm` 为 `system_one` 时每个实例都必填，包括被 `system_one_opts.fallback` 指定的实例。 |
+ | logging                             | object         | 否    |                                   |              | 日志配置。不影响 `error.log`。 |
+ | logging.summaries                   | boolean        | 否    | false                           |              | 如果为 true，记录请求 LLM 模型、持续时间、请求和响应令牌。 |
+ | logging.payloads                    | boolean        | 否    | false                           |              | 如果为 true，记录请求和响应负载。 |
+@@ -140,6 +141,18 @@ import TabItem from '@theme/TabItem';
+ | semantic_opts.embeddings.auth.query | object         | 否    |                                   |              | 认证查询参数。加密存储。 |
+ | semantic_opts.embeddings.timeout    | integer        | 否    | 3000                            | 最小值为 1  | 嵌入请求的超时时间（毫秒）。每个请求都会同步嵌入查询提示词，因此该值限定了当嵌入端点变慢或不可用时每个请求增加的延迟上限（随后请求会 fail-open 到回退实例）。 |
+ | semantic_opts.embeddings.ssl_verify | boolean        | 否    | true                            |              | 如果为 true，验证嵌入服务的证书。 |
++| system_one_opts                     | object         | 否    |                                   |              | `system_one` 均衡器的选项。当 `balancer.algorithm` 为 `system_one` 时必填。 |
++| system_one_opts.endpoint            | string         | 是    |                                   |              | System One API 的完整 URL，例如 `https://api.example.com/v1/systemone`。 |
++| system_one_opts.model               | string         | 是    |                                   |              | 对实例进行排序的 System One 模型，例如 `jev`。 |
++| system_one_opts.auth                | object         | 否    |                                   |              | System One API 的认证配置。 |
++| system_one_opts.auth.header         | object         | 否    |                                   |              | 认证请求头。加密存储。 |
++| system_one_opts.auth.query          | object         | 否    |                                   |              | 认证查询参数。加密存储。 |
++| system_one_opts.instructions        | string         | 否    |                                   |              | 路由问题的指令。默认使用一条通用指令，要求选择最合适的实例。 |
++| system_one_opts.threshold           | number         | 否    | 0                               | 0 到 1       | 实例被选中所需的最小概率。当没有可用实例达到该值时，请求回退到 `fallback` 实例；若未指定，则回退到第一个实例。重试时同样适用：只有当排序中的下一个实例达到阈值时才会重试该实例，否则重试 `fallback` 实例。 |
++| system_one_opts.fallback            | string         | 否    |                                   |              | 当 System One 请求失败或没有实例达到阈值时，路由到的实例名称。它本身也是一个参与排名的普通实例，同样需要配置 `description`。未设置时默认回退到第一个实例。 |
++| system_one_opts.timeout             | integer        | 否    | 3000                            | 最小值为 1  | System One 请求的超时时间（毫秒）。每个请求都会同步调用 System One API，因此该值限定了当端点变慢或不可用时每个请求增加的延迟上限（随后请求会 fail-open 到回退实例）。 |
++| system_one_opts.ssl_verify          | boolean        | 否    | true                            |              | 如果为 true，验证 System One API 的证书。 |
++| system_one_opts.debugging           | boolean        | 否    | false                           |              | 若为 true，通过 `X-AI-System-One-Probabilities` 和 `X-AI-System-One-Picked-Instance` 响应头暴露各实例的概率和路由决策，用于调试。 |
+ | timeout                             | integer        | 否    | 30000                           | 大于或等于 1 | 请求 LLM 服务时的请求超时时间（毫秒）。应用于单次 socket 操作（连接 / 发送 / 读取块），不限制流式响应的总时长。 |
+ | max_stream_duration_ms              | integer        | 否    |                                 | 大于或等于 1 | 流式 AI 响应的总墙钟时长上限（毫秒）。若上游在此时间后仍持续发送数据，网关将关闭连接。未设置时不限制。用于防护上游持续输出 token 导致网关 CPU 被打满的异常情况。中途触发上限时，下游 SSE 流会被截断（不再发送协议特定的终止标记，例如 `[DONE]`、`message_stop` 或 `response.completed`），客户端应将缺失的终止标记视为响应未完成。 |
+ | max_response_bytes                  | integer        | 否    |                                 | 大于或等于 1 | 单次 AI 响应（流式或非流式）允许从上游读取的最大总字节数。超出时关闭连接。非流式响应若存在 `Content-Length`，在读取 body 之前预检；否则（chunked 传输）与流式响应一样在接收字节的过程中增量检查。未设置时不限制。 |
+@@ -2937,3 +2950,139 @@ semantic routing: no instance cleared threshold (scores: code:0.3057,translate:0
+ 如果开启了 `debugging` 却完全没有这两个响应头，说明嵌入请求本身失败了，请求在计算任何得分之前就已回退到回退实例，失败原因会以 `warn` 级别记录。
+ 
+ 由于 `debugging` 会向调用方暴露实例名称，生产环境应保持关闭，改用日志排查。
++
++### 使用 System One 模型路由
++
++以下示例演示了如何使用 `system_one` 算法，让 System One 模型为每个请求选择实例。System One 模型（例如 [TypeSafe Jev](https://en.wikipedia.org/wiki/Jev_(AI_model)) 或 Cloudflare Clef）是一种判别式模型：它不生成文本，而是针对输入回答类型化的问题，并返回概率分布。插件将请求提示词作为 `state` 发送，并提出一个 `choice` 类型的问题，其选项是各实例的名称，每个选项由实例的 `description` 描述。随后插件将请求转发给概率最高、健康且未被限流的实例。
++
++与 `semantic` 相比，路由策略是每个实例的自然语言描述，而不是一组示例提示词，并且不需要嵌入模型。由于模型会对所有实例进行排序，插件可以跳过不健康或被限流的实例，并在下一个概率最高的实例上重试。
++
++创建如下路由，并相应地更新 LLM 提供商、System One 端点和模型以及 API 密钥。`default` 实例被指定为 `system_one_opts.fallback`，当 System One 请求失败或没有实例达到阈值时兜底：
++
++```shell
++curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
++  -H "X-API-KEY: ${admin_key}" \
++  -d '{
++    "id": "ai-proxy-multi-route",
++    "uri": "/anything",
++    "methods": ["POST"],
++    "plugins": {
++      "ai-proxy-multi": {
++        "balancer": {
++          "algorithm": "system_one"
++        },
++        "system_one_opts": {
++          "endpoint": "https://api.example.com/v1/systemone",
++          "model": "jev",
++          "auth": {
++            "header": {
++              "Authorization": "Bearer '"$YOUR_SYSTEM_ONE_API_KEY"'"
++            }
++          },
++          "threshold": 0.3,
++          "fallback": "default"
++        },
++        "fallback_strategy": ["http_429", "http_5xx"],
++        "instances": [
++          {
++            "name": "code",
++            "provider": "openai",
++            "weight": 1,
++            "auth": {
++              "header": {
++                "Authorization": "Bearer '"$YOUR_LLM_API_KEY"'"
++              }
++            },
++            "options": {
++              "model": "gpt-4o"
++            },
++            "description": "Writing, debugging and reviewing code."
++          },
++          {
++            "name": "translate",
++            "provider": "openai",
++            "weight": 1,
++            "auth": {
++              "header": {
++                "Authorization": "Bearer '"$YOUR_LLM_API_KEY"'"
++              }
++            },
++            "options": {
++              "model": "gpt-4o-mini"
++            },
++            "description": "Translating and summarizing text."
++          },
++          {
++            "name": "default",
++            "provider": "openai",
++            "weight": 1,
++            "auth": {
++              "header": {
++                "Authorization": "Bearer '"$YOUR_LLM_API_KEY"'"
++              }
++            },
++            "options": {
++              "model": "gpt-4o-mini"
++            },
++            "description": "General questions and conversation with no specialist need."
++          }
++        ]
++      }
++    }
++  }'
++```
++
++发送一个编程类提示词的请求：
++
++```shell
++curl "http://127.0.0.1:9080/anything" -X POST \
++  -H "Content-Type: application/json" \
++  -d '{
++    "model": "auto",
++    "messages": [
++      { "role": "user", "content": "help me debug this python code" }
++    ]
++  }'
++```
++
++请求应被路由到 `code` 实例，并由 `gpt-4o` 处理。如果 `code` 实例返回 `5xx` 或 `429` 状态码，请求会在下一个达到 `threshold` 且概率最高的实例上重试，否则在回退实例 `default` 上重试，而不会再次询问 System One 模型。
++
++插件发送给 System One API 的请求类似如下：
++
++```json
++{
++  "model": "jev",
++  "state": "help me debug this python code",
++  "questions": {
++    "instance": {
++      "type": "choice",
++      "instructions": "Choose the option best suited to answer this request. ...",
++      "criteria": {
++        "code": "Writing, debugging and reviewing code.",
++        "translate": "Translating and summarizing text.",
++        "default": "General questions and conversation with no specialist need."
++      }
++    }
++  }
++}
++```
++
++插件根据响应中的 `answers.instance.probabilities` 对实例进行排序。如果响应中没有概率分布，插件会改用 `answers.instance.choice`。
++
++#### 调试路由决策
++
++将 `system_one_opts.debugging` 设置为 `true`，插件会报告每个实例的概率以及最终选择的实例：
++
++```text
++HTTP/1.1 200 OK
++X-AI-System-One-Picked-Instance: code
++X-AI-System-One-Probabilities: code:0.9100,default:0.0600,translate:0.0300
++```
++
++当 System One 请求失败，或没有可用实例达到阈值时，插件会以 `warn` 级别记录原因，并路由到回退实例：
++
++```text
++system_one routing: system one request failed: request: timeout, falling back
++```
++
++由于 `debugging` 会向调用方暴露实例名称，生产环境中请保持关闭，改用日志进行排查。
+diff --git a/t/plugin/ai-proxy-multi-system-one.t b/t/plugin/ai-proxy-multi-system-one.t
+new file mode 100644
+index 00000000..15caf67f
+--- /dev/null
++++ b/t/plugin/ai-proxy-multi-system-one.t
+@@ -0,0 +1,686 @@
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++use t::APISIX 'no_plan';
++
++log_level("info");
++repeat_each(1);
++no_long_string();
++no_root_location();
++no_shuffle();
++
++add_block_preprocessor(sub {
++    my ($block) = @_;
++
++    if (!defined $block->request) {
++        $block->set_value("request", "GET /t");
++    }
++
++    my $http_config = $block->http_config // <<_EOC_;
++        # Mock System One API: answers the single choice question with a
++        # probability distribution steered by keywords in the state.
++        server {
++            server_name mock_system_one;
++            listen 6796;
++            default_type 'application/json';
++            location /v1/systemone {
++                content_by_lua_block {
++                    local json = require("cjson.safe")
++                    ngx.req.read_body()
++                    -- the System One call must not carry the client's headers
++                    ngx.log(ngx.WARN, "s1-recv-cookie:", ngx.var.http_cookie or "none")
++                    ngx.log(ngx.WARN, "s1-recv-auth:", ngx.var.http_authorization or "none")
++                    local body = json.decode(ngx.req.get_body_data()) or {}
++                    local q = body.questions and body.questions.instance or {}
++                    local names = {}
++                    for name, criterion in pairs(q.criteria or {}) do
++                        names[#names + 1] = name .. "=" .. criterion
++                    end
++                    table.sort(names)
++                    ngx.log(ngx.WARN, "s1-recv model=", body.model, " type=", q.type,
++                            " criteria=", table.concat(names, "|"))
++                    local state = string.lower(body.state or "")
++                    ngx.log(ngx.WARN, "s1-recv-state:", state)
++
++                    if state:find("servererror") then
++                        -- an error body echoing the prompt, as some providers
++                        -- do -- it must never reach our logs
++                        ngx.status = 500
++                        ngx.say('{"error":"bad input: ', state, ' SENSITIVE-ECHO"}')
++                        return
++                    elseif state:find("scalarbody") then
++                        ngx.say("null")
++                        return
++                    elseif state:find("nanprob") then
++                        ngx.say('{"answers":{"instance":{"probabilities":'
++                                .. '{"code":1e999,"cheap":0,"default":0}}}}')
++                        return
++                    elseif state:find("slowanswer") then
++                        ngx.sleep(0.5)
++                    end
++
++                    local probs
++                    if state:find("choiceonly") then
++                        ngx.say(json.encode({ answers = { instance = {
++                            choice = "cheap", confidence = 0.8 } } }))
++                        return
++                    elseif state:find("unsure") then
++                        probs = { code = 0.4, cheap = 0.35, default = 0.25 }
++                    elseif state:find("python") or state:find("debug") then
++                        probs = { code = 0.9, cheap = 0.05, default = 0.05 }
++                    elseif state:find("translate") then
++                        probs = { code = 0.1, cheap = 0.8, default = 0.1 }
++                    else
++                        probs = { code = 0.1, cheap = 0.2, default = 0.7 }
++                    end
++                    local choice, best = nil, -1
++                    for name, p in pairs(probs) do
++                        if p > best then
++                            choice, best = name, p
++                        end
++                    end
++                    ngx.say(json.encode({
++                        model = body.model,
++                        answers = { instance = {
++                            choice = choice, confidence = best, probabilities = probs,
++                        } },
++                    }))
++                }
++            }
++        }
++
++        # Mock LLM: echoes the model it received so tests can tell which
++        # instance was selected. /fail always answers 500.
++        server {
++            server_name mock_llm;
++            listen 6795;
++            default_type 'application/json';
++            location /v1/chat/completions {
++                content_by_lua_block {
++                    local json = require("cjson.safe")
++                    ngx.req.read_body()
++                    local body = json.decode(ngx.req.get_body_data()) or {}
++                    ngx.print(body.model or "unknown")
++                }
++            }
++            location /fail/v1/chat/completions {
++                content_by_lua_block {
++                    ngx.status = 500
++                    ngx.print('{"error":"upstream down"}')
++                }
++            }
++            location /status {
++                return 200;
++            }
++        }
++_EOC_
++    $block->set_value("http_config", $http_config);
++
++    my $user_yaml_config = <<_EOC_;
++plugins:
++  - ai-proxy-multi
++_EOC_
++    $block->set_value("extra_yaml_config", $user_yaml_config);
++});
++
++run_tests();
++
++__DATA__
++
++=== TEST 1: schema - system_one_opts, descriptions and fallback are validated
++--- config
++    location /t {
++        content_by_lua_block {
++            local plugin = require("apisix.plugins.ai-proxy-multi")
++            local function inst(name, description)
++                return {
++                    name = name, provider = "openai", weight = 1,
++                    auth = { header = { Authorization = "Bearer token" } },
++                    description = description,
++                }
++            end
++            local opts = { endpoint = "http://127.0.0.1:6796/v1/systemone", model = "jev" }
++            local function check(conf)
++                local ok, err = plugin.check_schema(conf)
++                ngx.say(ok and "passed" or err)
++            end
++
++            check({ balancer = { algorithm = "system_one" }, system_one_opts = opts,
++                    instances = { inst("a", "A."), inst("b", "B.") } })
++            check({ balancer = { algorithm = "system_one" },
++                    instances = { inst("a", "A."), inst("b", "B.") } })
++            check({ balancer = { algorithm = "system_one" }, system_one_opts = opts,
++                    instances = { inst("a", "A."), inst("b") } })
++            check({ balancer = { algorithm = "system_one" },
++                    system_one_opts = { endpoint = opts.endpoint, model = "jev",
++                                        fallback = "c" },
++                    instances = { inst("a", "A."), inst("b", "B.") } })
++            check({ balancer = { algorithm = "system_one" },
++                    system_one_opts = { endpoint = "http:///v1/systemone", model = "jev" },
++                    instances = { inst("a", "A."), inst("b", "B.") } })
++            check({ balancer = { algorithm = "system_one" },
++                    system_one_opts = { endpoint = opts.endpoint },
++                    instances = { inst("a", "A."), inst("b", "B.") } })
++            local many = {}
++            for i = 1, 65 do
++                many[i] = inst("i" .. i, "Instance " .. i .. ".")
++            end
++            check({ balancer = { algorithm = "system_one" }, system_one_opts = opts,
++                    instances = many })
++            -- descriptions are not required by the other algorithms
++            check({ instances = { inst("a"), inst("b") } })
++        }
++    }
++--- response_body_like
++passed
++must configure `system_one_opts` when balancer algorithm is system_one
++instance 'b': must configure `description` for the system_one algorithm
++`system_one_opts.fallback` names unknown instance 'c'
++invalid `system_one_opts.endpoint`
++property "system_one_opts" validation failed: property "model" is required
++the system_one algorithm supports at most 64 instances
++passed
++
++
++
++=== TEST 2: configure a system_one route (code / cheap / default)
++--- config
++    location /t {
++        content_by_lua_block {
++            -- Build the config as a Lua table: a long inline JSON block can
++            -- cross nginx's config buffer boundary and be misparsed.
++            local core = require("apisix.core")
++            local t = require("lib.test_admin").test
++            local function inst(name, model, description)
++                return {
++                    name = name, provider = "openai", weight = 1,
++                    auth = { header = { Authorization = "Bearer llm-token" } },
++                    options = { model = model },
++                    override = { endpoint = "http://127.0.0.1:6795/v1/chat/completions" },
++                    description = description,
++                }
++            end
++            local conf = {
++                uri = "/anything",
++                plugins = {
++                    ["ai-proxy-multi"] = {
++                        balancer = { algorithm = "system_one" },
++                        system_one_opts = {
++                            endpoint = "http://127.0.0.1:6796/v1/systemone",
++                            model = "jev",
++                            auth = { header = { Authorization = "Bearer s1-token" } },
++                            threshold = 0.5,
++                            fallback = "default",
++                            timeout = 200,
++                        },
++                        instances = {
++                            inst("code", "model-code", "Programming and debugging."),
++                            inst("cheap", "model-cheap", "Translation and summaries."),
++                            inst("default", "model-fallback", "Everything else."),
++                        },
++                        ssl_verify = false,
++                    },
++                },
++            }
++            local code, body = t('/apisix/admin/routes/1', ngx.HTTP_PUT,
++                                 core.json.encode(conf))
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++            ngx.say("passed")
++        }
++    }
++--- response_body
++passed
++--- no_error_log
++[error]
++
++
++
++=== TEST 3: a coding prompt routes to the code instance
++--- request
++POST /anything
++{"model":"auto","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"help me debug this python code"}]}
++--- more_headers
++Content-Type: application/json
++--- response_body chomp
++model-code
++--- error_log
++s1-recv-auth:Bearer s1-token
++s1-recv model=jev type=choice criteria=cheap=Translation and summaries.|code=Programming and debugging.|default=Everything else.
++s1-recv-state:help me debug this python code
++system_one routing picked instance: code
++--- no_error_log
++[error]
++
++
++
++=== TEST 4: a translation prompt routes to the cheap instance
++--- request
++POST /anything
++{"model":"auto","messages":[{"role":"user","content":"please translate this to english"}]}
++--- more_headers
++Content-Type: application/json
++--- response_body chomp
++model-cheap
++--- no_error_log
++[error]
++
++
++
++=== TEST 5: no instance clears the threshold, falls back to the fallback instance
++--- request
++POST /anything
++{"model":"auto","messages":[{"role":"user","content":"unsure what this is"}]}
++--- more_headers
++Content-Type: application/json
++--- response_body chomp
++model-fallback
++--- error_log
++no available instance cleared the threshold, falling back to default
++--- no_error_log
++[error]
++
++
++
++=== TEST 6: non-200 fails open to the fallback, without logging the upstream body
++--- request
++POST /anything
++{"model":"auto","messages":[{"role":"user","content":"servererror python code"}]}
++--- more_headers
++Content-Type: application/json
++--- error_code: 200
++--- response_body chomp
++model-fallback
++--- error_log
++system_one routing: system one endpoint returned status 500, falling back
++--- no_error_log
++SENSITIVE-ECHO
++[error]
++
++
++
++=== TEST 7: 200 with a non-table body fails open instead of raising
++--- request
++POST /anything
++{"model":"auto","messages":[{"role":"user","content":"scalarbody python"}]}
++--- more_headers
++Content-Type: application/json
++--- response_body chomp
++model-fallback
++--- error_log
++invalid system one response
++--- no_error_log
++[error]
++
++
++
++=== TEST 8: a non-finite probability fails open instead of poisoning the ranking
++--- request
++POST /anything
++{"model":"auto","messages":[{"role":"user","content":"nanprob python"}]}
++--- more_headers
++Content-Type: application/json
++--- response_body chomp
++model-fallback
++--- error_log
++invalid probability for option 'code'
++--- no_error_log
++[error]
++
++
++
++=== TEST 9: a timeout fails open to the fallback
++--- request
++POST /anything
++{"model":"auto","messages":[{"role":"user","content":"slowanswer python"}]}
++--- more_headers
++Content-Type: application/json
++--- response_body chomp
++model-fallback
++--- error_log eval
++qr/system_one routing: system one request failed: .*timeout, falling back/
++
++
++
++=== TEST 10: an answer with only a choice and confidence is ranked by it
++--- request
++POST /anything
++{"model":"auto","messages":[{"role":"user","content":"choiceonly"}]}
++--- more_headers
++Content-Type: application/json
++--- response_body chomp
++model-cheap
++--- no_error_log
++[error]
++
++
++
++=== TEST 11: client headers are not forwarded to the System One endpoint
++--- request
++POST /anything
++{"model":"auto","messages":[{"role":"user","content":"help me debug this python code"}]}
++--- more_headers
++Content-Type: application/json
++Cookie: session=super-secret
++--- response_body chomp
++model-code
++--- error_log
++s1-recv-cookie:none
++--- no_error_log
++s1-recv-cookie:session=super-secret
++
++
++
++=== TEST 12: multimodal content arrays are routed by their text parts
++--- request
++POST /anything
++{"model":"auto","messages":[{"role":"user","content":[{"type":"text","text":"debug my python"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}
++--- more_headers
++Content-Type: application/json
++--- response_body chomp
++model-code
++--- error_log
++s1-recv-state:debug my python
++
++
++
++=== TEST 13: reconfigure with debugging and ranked retry on 5xx
++--- config
++    location /t {
++        content_by_lua_block {
++            local core = require("apisix.core")
++            local t = require("lib.test_admin").test
++            local function inst(name, model, description, endpoint)
++                return {
++                    name = name, provider = "openai", weight = 1,
++                    auth = { header = { Authorization = "Bearer llm-token" } },
++                    options = { model = model },
++                    override = { endpoint = endpoint
++                                 or "http://127.0.0.1:6795/v1/chat/completions" },
++                    description = description,
++                }
++            end
++            local conf = {
++                uri = "/anything",
++                plugins = {
++                    ["ai-proxy-multi"] = {
++                        balancer = { algorithm = "system_one" },
++                        system_one_opts = {
++                            endpoint = "http://127.0.0.1:6796/v1/systemone",
++                            model = "jev",
++                            fallback = "default",
++                            debugging = true,
++                        },
++                        fallback_strategy = { "http_5xx" },
++                        instances = {
++                            inst("code", "model-code", "Programming and debugging.",
++                                 "http://127.0.0.1:6795/fail/v1/chat/completions"),
++                            inst("cheap", "model-cheap", "Translation and summaries."),
++                            inst("default", "model-fallback", "Everything else."),
++                        },
++                        ssl_verify = false,
++                    },
++                },
++            }
++            local code, body = t('/apisix/admin/routes/1', ngx.HTTP_PUT,
++                                 core.json.encode(conf))
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++            ngx.say("passed")
++        }
++    }
++--- response_body
++passed
++
++
++
++=== TEST 14: debugging headers expose the ranking and the pick
++--- request
++POST /anything
++{"model":"auto","messages":[{"role":"user","content":"please translate this"}]}
++--- more_headers
++Content-Type: application/json
++--- response_headers
++X-AI-System-One-Probabilities: cheap:0.8000,code:0.1000,default:0.1000
++X-AI-System-One-Picked-Instance: cheap
++--- response_body chomp
++model-cheap
++
++
++
++=== TEST 15: a failing pick is retried on the next instance of the ranking
++--- request
++POST /anything
++{"model":"auto","messages":[{"role":"user","content":"debug my python"}]}
++--- more_headers
++Content-Type: application/json
++--- response_body chomp
++model-cheap
++--- error_log
++ai instance code returned status 500, falling back to cheap
++--- grep_error_log eval
++qr/s1-recv-state:/
++--- grep_error_log_out
++s1-recv-state:
++
++
++
++=== TEST 16: an instance that fails its active health check is skipped
++--- config
++    location /t {
++        content_by_lua_block {
++            local core = require("apisix.core")
++            local t = require("lib.test_admin").test
++            local function inst(name, model, description, port)
++                return {
++                    name = name, provider = "openai", weight = 1,
++                    auth = { header = { Authorization = "Bearer llm-token" } },
++                    options = { model = model },
++                    override = { endpoint = "http://127.0.0.1:" .. port
++                                            .. "/v1/chat/completions" },
++                    description = description,
++                    checks = { active = {
++                        type = "http",
++                        http_path = "/status",
++                        healthy = { interval = 1, successes = 1 },
++                        unhealthy = { interval = 1, http_failures = 1,
++                                      tcp_failures = 1, timeouts = 1 },
++                    } },
++                }
++            end
++            local conf = {
++                uri = "/health",
++                plugins = {
++                    ["ai-proxy-multi"] = {
++                        balancer = { algorithm = "system_one" },
++                        system_one_opts = {
++                            endpoint = "http://127.0.0.1:6796/v1/systemone",
++                            model = "jev",
++                            fallback = "default",
++                        },
++                        instances = {
++                            -- nothing listens on 6794: the checker marks it down
++                            inst("code", "model-code", "Programming and debugging.", 6794),
++                            inst("cheap", "model-cheap", "Translation and summaries.", 6795),
++                            inst("default", "model-fallback", "Everything else.", 6795),
++                        },
++                        ssl_verify = false,
++                    },
++                },
++            }
++            local code, body = t('/apisix/admin/routes/2', ngx.HTTP_PUT,
++                                 core.json.encode(conf))
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++
++            local http = require("resty.http")
++            local uri = "http://127.0.0.1:" .. ngx.var.server_port .. "/health"
++            local function send()
++                local httpc = http.new()
++                local res = assert(httpc:request_uri(uri, {
++                    method = "POST",
++                    headers = { ["Content-Type"] = "application/json" },
++                    body = [[{"messages":[{"role":"user","content":"debug my python"}]}]],
++                }))
++                return res.body
++            end
++            -- the first request creates the checkers; give them time to probe
++            send()
++            ngx.sleep(3)
++            ngx.say(send())
++        }
++    }
++--- timeout: 10
++--- response_body
++model-cheap
++--- error_log
++system_one routing: instance code is unhealthy
++
++
++
++=== TEST 17: the System One auth header is encrypted in etcd
++--- yaml_config
++apisix:
++    data_encryption:
++        enable_encrypt_fields: true
++        keyring:
++            - edd1c9f0985e76a2
++--- config
++    location /t {
++        content_by_lua_block {
++            local core = require("apisix.core")
++            local json = require("toolkit.json")
++            local t = require("lib.test_admin").test
++            local conf = {
++                uri = "/encrypted",
++                plugins = {
++                    ["ai-proxy-multi"] = {
++                        balancer = { algorithm = "system_one" },
++                        system_one_opts = {
++                            endpoint = "http://127.0.0.1:6796/v1/systemone",
++                            model = "jev",
++                            auth = { header = { Authorization = "Bearer s1-token" } },
++                        },
++                        instances = {
++                            { name = "a", provider = "openai", weight = 1,
++                              auth = { header = { Authorization = "Bearer x" } },
++                              description = "A." },
++                            { name = "b", provider = "openai", weight = 1,
++                              auth = { header = { Authorization = "Bearer y" } },
++                              description = "B." },
++                        },
++                    },
++                },
++            }
++            local code, body = t('/apisix/admin/routes/3', ngx.HTTP_PUT,
++                                 core.json.encode(conf))
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++            ngx.sleep(0.5)
++
++            local _, _, res = t('/apisix/admin/routes/3', ngx.HTTP_GET)
++            res = json.decode(res)
++            local opts = res.value.plugins["ai-proxy-multi"].system_one_opts
++            ngx.say(opts.auth.header.Authorization)
++
++            local etcd = require("apisix.core.etcd")
++            local stored = assert(etcd.get('/routes/3'))
++            opts = stored.body.node.value.plugins["ai-proxy-multi"].system_one_opts
++            ngx.say(opts.auth.header.Authorization == "Bearer s1-token"
++                    and "plaintext" or "encrypted")
++        }
++    }
++--- response_body
++Bearer s1-token
++encrypted
++
++
++=== TEST 18: reconfigure: failing top pick, the rest below the threshold
++--- config
++    location /t {
++        content_by_lua_block {
++            local core = require("apisix.core")
++            local t = require("lib.test_admin").test
++            local function inst(name, model, description, endpoint)
++                return {
++                    name = name, provider = "openai", weight = 1,
++                    auth = { header = { Authorization = "Bearer llm-token" } },
++                    options = { model = model },
++                    override = { endpoint = endpoint
++                                 or "http://127.0.0.1:6795/v1/chat/completions" },
++                    description = description,
++                }
++            end
++            local conf = {
++                uri = "/anything",
++                plugins = {
++                    ["ai-proxy-multi"] = {
++                        balancer = { algorithm = "system_one" },
++                        system_one_opts = {
++                            endpoint = "http://127.0.0.1:6796/v1/systemone",
++                            model = "jev",
++                            fallback = "default",
++                            threshold = 0.5,
++                        },
++                        fallback_strategy = { "http_5xx" },
++                        instances = {
++                            inst("code", "model-code", "Programming and debugging.",
++                                 "http://127.0.0.1:6795/fail/v1/chat/completions"),
++                            inst("cheap", "model-cheap", "Translation and summaries."),
++                            inst("default", "model-fallback", "Everything else."),
++                        },
++                        ssl_verify = false,
++                    },
++                },
++            }
++            local code, body = t('/apisix/admin/routes/1', ngx.HTTP_PUT,
++                                 core.json.encode(conf))
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++            ngx.say("passed")
++        }
++    }
++--- response_body
++passed
++
++
++
++=== TEST 19: the retry goes to the fallback, not to a runner-up below the threshold
++--- request
++POST /anything
++{"model":"auto","messages":[{"role":"user","content":"debug my python"}]}
++--- more_headers
++Content-Type: application/json
++--- response_body chomp
++model-fallback
++--- error_log
++no untried available instance cleared the threshold, falling back to default
++ai instance code returned status 500, falling back to default
