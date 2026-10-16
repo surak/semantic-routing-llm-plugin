@@ -4,10 +4,12 @@
   python3 test/live_routing.py http://127.0.0.1:9080/v1/chat/completions
 
 Needs a route with ai-proxy-multi's system_one balancer and
-system_one_opts.debugging on. Prints the picked instance, its probability (from
-X-AI-System-One-Probabilities), the model that answered (from the response body)
-and the total latency. Exits non-zero if any request fails. No API key needed:
-the gateway holds the credentials.
+system_one_opts.debugging on. Prints the instance the System One model ranked
+first and its probability (X-AI-System-One-Probabilities), the instance that
+served the request (X-AI-System-One-Picked-Instance; it differs from the first
+one after a retry or a fallback), the model that answered (from the response
+body) and the total latency. Exits non-zero if any request fails. No API key
+needed: the gateway holds the credentials.
 """
 import json
 import sys
@@ -38,11 +40,13 @@ def call(url, prompt):
         data = json.load(resp)
         h = resp.headers
     picked = h.get("X-AI-System-One-Picked-Instance", "-")
-    probs = dict(p.split(":") for p in h.get("X-AI-System-One-Probabilities", "").split(",") if ":" in p)
+    ranking = [p.split(":") for p in h.get("X-AI-System-One-Probabilities", "").split(",") if ":" in p]
+    top, prob = ranking[0] if ranking else ("-", "-")
     return {
+        "top": top,
+        "prob": prob,
         "routed": picked,
-        "conf": probs.get(picked, "-"),
-        "fallback": "" if probs else "no ranking (fallback)",
+        "note": "no ranking: fallback" if not ranking else ("" if picked == top else "retried or fell back"),
         "served": (data.get("model") or "?")[:42],
         "secs": time.monotonic() - start,
     }
@@ -51,7 +55,7 @@ def call(url, prompt):
 def main():
     url = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:9080/v1/chat/completions"
     failed = 0
-    print(f"{'case':13} {'routed to':32} {'conf':>6}  {'secs':>5}  served by")
+    print(f"{'case':13} {'ranked first':32} {'p':>6}  {'served by instance':24} {'secs':>5}  model")
     for name, prompt in PROMPTS:
         try:
             r = call(url, prompt)
@@ -59,8 +63,8 @@ def main():
             failed += 1
             print(f"{name:13} ERROR {exc}")
             continue
-        extra = f"  [fallback: {r['fallback']}]" if r["fallback"] else ""
-        print(f"{name:13} {r['routed']:32} {r['conf'][:6]:>6}  {r['secs']:5.1f}  {r['served']}{extra}")
+        extra = f"  [{r['note']}]" if r["note"] else ""
+        print(f"{name:13} {r['top']:32} {r['prob'][:6]:>6}  {r['routed']:24} {r['secs']:5.1f}  {r['served']}{extra}")
     sys.exit(1 if failed else 0)
 
 

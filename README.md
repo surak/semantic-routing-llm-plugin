@@ -90,20 +90,26 @@ X-AI-System-One-Probabilities: alias-mimo-v2.6-pro:0.9410,alias-mimo-v2.6-flash:
 
 The example has `debugging` on, which adds those headers; turn it off in production.
 
-Observed with the live Blablador API (2026-10-16):
+Observed with the live Blablador API (2026-10-16, `test/live_routing.py`):
 
-| Prompt | Picked instance | Probability |
+| Prompt | Ranked first | Probability |
 | --- | --- | --- |
 | Python traceback: KeyError in a loop | `alias-code` | 0.81 |
 | Implement an LRU cache in Rust | `alias-glm-5.3-flash` | 0.74 |
 | One-line bash, "in 2 seconds" | `alias-qwen38-quick` | 0.95 |
 | Prove √2 is irrational | `alias-mimo-v2.6-pro` | 0.94 |
+| Train catch-up time | `alias-mimo-v2.6-flash` | 0.52 |
 | Sentinel-2 deforestation pipeline | `alias-eve` | 0.95 |
 | German press release | `alias-apertus` | 0.91 |
 | Rainy-Monday motivation | `alias-muse` | 0.89 |
 | 400 PDFs of meeting minutes | `alias-kimi-k3-1m` | 0.93 |
+| Multi-agent deployment system | `alias-huge` | 0.92 |
 | Capital of Australia | `alias-fast` | 0.94 |
-| Multi-agent deployment system | `alias-huge` (0.92) answered 503, so the request was retried on the fallback `alias-large` | |
+
+Each request was served by the instance ranked first, except during two outages of Blablador
+models: once `alias-huge`, once `alias-muse` answered 503 ("temporarily unavailable"). Every other
+instance was below the 0.3 threshold, so each request was retried on the fallback `alias-large`
+and the client still got an answer.
 
 ## Run on APISIX 3.19
 
