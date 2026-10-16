@@ -1,0 +1,12 @@
+apisix:
+  node_listen: 9080
+  extra_lua_path: "/opt/ai-decision-router/?.lua"
+deployment:
+  role: data_plane
+  role_data_plane:
+    config_provider: yaml
+plugins:
+  - ai-decision-router
+  - ai-proxy-multi
+  - ai-proxy
+  - prometheus      # ai-proxy depends on its shared dict

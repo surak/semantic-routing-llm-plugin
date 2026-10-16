@@ -1,0 +1,16 @@
+# Blablador auto-routing gateway.
+#   export BLABLADOR_API_KEY=...      # or put it in examples/blablador/.env
+#   docker compose up -d
+#   curl localhost:9080/v1/chat/completions -H 'Content-Type: application/json' \
+#     -d '{"model":"auto","messages":[{"role":"user","content":"Fix this Python traceback ..."}]}' -i
+services:
+  apisix:
+    image: apache/apisix:${APISIX_VERSION:-3.19.0-debian}
+    ports:
+      - "${APISIX_PORT:-9080}:9080"
+    environment:
+      BLABLADOR_API_KEY: ${BLABLADOR_API_KEY:?set BLABLADOR_API_KEY}
+    volumes:
+      - ../../apisix:/opt/ai-decision-router/apisix:ro
+      - ./config.yaml:/usr/local/apisix/conf/config.yaml:ro
+      - ./apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro
