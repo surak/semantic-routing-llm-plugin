@@ -10,38 +10,52 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: luacheck
-        run: docker run --rm -v "$PWD":/d -w /d pipelinecomponents/luacheck luacheck apisix
+      - name: luacheck (APISIX settings)
+        run: docker run --rm -v "$PWD":/d -w /d pipelinecomponents/luacheck luacheck overlay
       - name: shellcheck
-        run: shellcheck -S warning test/run_e2e.sh examples/admin-api-route.sh
+        run: >
+          shellcheck -S warning t/run.sh test/run_e2e.sh examples/admin-api-route.sh
+          contrib/sync_from_apisix.sh deploy/kubernetes/deploy.sh site/build.sh
       - name: python syntax
-        run: python3 -m py_compile test/mock_server.py
+        run: python3 -m py_compile test/mock_server.py test/live_routing.py contrib/build_docs.py
+      - name: overlay matches the patch
+        run: |
+          git clone -q --depth 1 --branch 3.19.0 https://github.com/apache/apisix.git /tmp/apisix
+          cd /tmp/apisix
+          git apply --include='apisix/*' "$GITHUB_WORKSPACE"/patches/*.patch
+          for f in apisix/plugins/ai-proxy-multi.lua apisix/plugins/ai-proxy/schema.lua \
+                   apisix/plugins/ai-proxy/system-one.lua; do
+            diff -u "$f" "$GITHUB_WORKSPACE/overlay/$f"
+          done
 
   test-nginx:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Test::Nginx suite (APISIX test harness)
+      - name: Test::Nginx suites with the patch applied (APISIX 3.19.0)
         run: t/run.sh
 
-  apisix-pr:
+  patch-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: prepare the APISIX pull request tree
+      - name: apply the patch to apache/apisix master
         run: |
-          git clone --depth 1 https://github.com/apache/apisix.git /tmp/apisix
-          python3 contrib/prepare_apisix_pr.py /tmp/apisix
+          git clone -q https://github.com/apache/apisix.git /tmp/apisix
+          cd /tmp/apisix
+          git -c user.name=ci -c user.email=ci@example.com am "$GITHUB_WORKSPACE"/patches/*.patch
       - name: luacheck (APISIX config)
-        run: docker run --rm -v /tmp/apisix:/d -w /d pipelinecomponents/luacheck luacheck -q apisix/plugins/ai-decision-router.lua
+        run: >
+          docker run --rm -v /tmp/apisix:/d -w /d pipelinecomponents/luacheck
+          luacheck -q apisix/plugins/ai-proxy-multi.lua apisix/plugins/ai-proxy/
       - name: markdownlint (APISIX config)
         run: |
           npm install -g markdownlint-cli@0.25.0
-          cd /tmp/apisix && markdownlint docs/en/latest/plugins/ai-decision-router.md docs/zh/latest/plugins/ai-decision-router.md
+          cd /tmp/apisix && markdownlint docs/en/latest/plugins/ai-proxy-multi.md docs/zh/latest/plugins/ai-proxy-multi.md
       - name: autocorrect (zh docs)
         run: |
           npm install -g autocorrect-node
-          cd /tmp/apisix && autocorrect --lint docs/zh/latest/plugins/ai-decision-router.md
+          cd /tmp/apisix && autocorrect --lint docs/zh/latest/plugins/ai-proxy-multi.md
       - name: license headers
         run: docker run --rm -v /tmp/apisix:/github/workspace apache/skywalking-eyes header check
 
@@ -53,7 +67,7 @@ jobs:
         apisix: ["3.19.0-debian"]
     steps:
       - uses: actions/checkout@v4
-      - name: end-to-end tests
+      - name: end-to-end tests (stock APISIX + overlay)
         env:
           APISIX_VERSION: ${{ matrix.apisix }}
         run: test/run_e2e.sh
