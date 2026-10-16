@@ -3,9 +3,11 @@
 
   python3 test/live_routing.py http://127.0.0.1:9080/v1/chat/completions
 
-Prints prompt, X-AI-Routed-Model, confidence, fallback reason, the model that
-answered (from the response body) and the total latency. Exits non-zero if any
-request fails. No API key needed: the gateway holds the credentials.
+Needs a route with ai-proxy-multi's system_one balancer and
+system_one_opts.debugging on. Prints the picked instance, its probability (from
+X-AI-System-One-Probabilities), the model that answered (from the response body)
+and the total latency. Exits non-zero if any request fails. No API key needed:
+the gateway holds the credentials.
 """
 import json
 import sys
@@ -27,18 +29,20 @@ PROMPTS = [
 ]
 
 
-def call(url, prompt, model="auto"):
-    body = json.dumps({"model": model, "max_tokens": 16,
+def call(url, prompt):
+    body = json.dumps({"model": "auto", "max_tokens": 16,
                        "messages": [{"role": "user", "content": prompt}]}).encode()
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     start = time.monotonic()
     with urllib.request.urlopen(req, timeout=300) as resp:
         data = json.load(resp)
         h = resp.headers
+    picked = h.get("X-AI-System-One-Picked-Instance", "-")
+    probs = dict(p.split(":") for p in h.get("X-AI-System-One-Probabilities", "").split(",") if ":" in p)
     return {
-        "routed": h.get("X-AI-Routed-Model", "-"),
-        "conf": h.get("X-AI-Routing-Confidence", "-"),
-        "fallback": h.get("X-AI-Routing-Fallback", ""),
+        "routed": picked,
+        "conf": probs.get(picked, "-"),
+        "fallback": "" if probs else "no ranking (fallback)",
         "served": (data.get("model") or "?")[:42],
         "secs": time.monotonic() - start,
     }
@@ -57,15 +61,6 @@ def main():
             continue
         extra = f"  [fallback: {r['fallback']}]" if r["fallback"] else ""
         print(f"{name:13} {r['routed']:32} {r['conf'][:6]:>6}  {r['secs']:5.1f}  {r['served']}{extra}")
-    # an explicit model must pass through untouched
-    try:
-        r = call(url, "Prove Fermat's little theorem.", model="alias-fast")
-        ok = r["routed"] == "-"
-        print(f"{'explicit':13} {'(not routed)' if ok else r['routed']:32} {'':>6}  {r['secs']:5.1f}  {r['served']}")
-        failed += not ok
-    except Exception as exc:
-        failed += 1
-        print(f"explicit      ERROR {exc}")
     sys.exit(1 if failed else 0)
 
 

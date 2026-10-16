@@ -1,4 +1,4 @@
-# End-to-end test stack: APISIX + mock decision model / LLM.
+# End-to-end test stack: stock APISIX + the system_one overlay + mocks.
 #   docker compose -f test/docker-compose.yml up -d
 services:
   mock:
@@ -12,6 +12,6 @@ services:
     ports:
       - "${APISIX_PORT:-9080}:9080"
     volumes:
-      - ../apisix:/opt/ai-decision-router/apisix:ro
+      - ../overlay/apisix:/opt/system-one/apisix:ro
       - ./config.yaml:/usr/local/apisix/conf/config.yaml:ro
       - ./apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro

@@ -1,17 +1,11 @@
-# APISIX config for the end-to-end tests: standalone (YAML) mode,
-# custom plugin loaded from /opt/ai-decision-router via extra_lua_path.
+# APISIX config for the end-to-end tests: standalone (YAML) mode with the
+# system_one overlay first on the Lua path. The default plugin list is kept.
 apisix:
   node_listen: 9080
-  extra_lua_path: "/opt/ai-decision-router/?.lua"
+  extra_lua_path: "/opt/system-one/?.lua"
 deployment:
   role: data_plane
   role_data_plane:
     config_provider: yaml
 nginx_config:
   error_log_level: info
-plugins:
-  - ai-decision-router
-  - ai-proxy-multi
-  - ai-proxy
-  - proxy-rewrite
-  - prometheus      # ai-proxy depends on its shared dict
